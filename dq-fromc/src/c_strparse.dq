@@ -1,0 +1,386 @@
+/*
+ * file:    c_strparse.dq
+ * brief:   C/C++ string parsing helpers derived from OStrParse
+ */
+
+use strparse
+
+object OCStrParse(OStrParse):
+public
+    func IsIdentStart(c : char) -> bool ..
+    func IsIdentChar(c : char) -> bool ..
+    func IsDigit(c : char) -> bool ..
+    func IsHexDigit(c : char) -> bool ..
+    func TrimSlice(s : strslice) -> strslice ..
+
+    func SkipHSpaces() ..
+    func SkipOneLineEnd() -> bool ..
+    func AtLineEnd() -> bool ..
+
+    func CheckSym(sym : rostr, consume : bool = true) -> bool ..
+    func CheckKeyword(kw : rostr, consume : bool = true) -> bool ..
+
+    func ReadCIdent(rval : refout str) -> bool ..
+    func SkipCLiteral() -> bool ..
+    func ReadCComment(rtext : refout str, is_block : refout bool) -> bool ..
+    func ReadTrailingComment() -> str ..
+    func ReadPreprocRaw() -> str ..
+
+    func ReadBalanced(open_ch : char, close_ch : char, rslice : refout strslice) -> bool ..
+    func ReadUntilTopLevel(stopchars : rostr, rslice : refout strslice) -> char ..
+    func SkipToSafeBoundary(startp : ^char) -> strslice ..
+endobject
+
+func TrimSlice(s : strslice) -> strslice ..
+
+implementation
+
+func TrimSlice(s : strslice) -> strslice:
+    var pstart : ^char = s.pchar
+    var pend   : ^char = pstart + s.length
+    while pstart < pend and (pstart^ == ' ' or pstart^ == '\t' or pstart^ == '\r' or pstart^ == '\n'):
+        ++pstart
+    endwhile
+    while pend > pstart and ((pend - 1)^ == ' ' or (pend - 1)^ == '\t' or (pend - 1)^ == '\r' or (pend - 1)^ == '\n'):
+        --pend
+    endwhile
+    return @.StrSlice(pstart, pend - pstart)
+endfunc
+
+func OCStrParse.TrimSlice(s : strslice) -> strslice:
+    return @.TrimSlice(s)
+endfunc
+
+func OCStrParse.IsIdentStart(c : char) -> bool:
+    return ('A' <= c <= 'Z') or ('a' <= c <= 'z') or c == '_'
+endfunc
+
+func OCStrParse.IsIdentChar(c : char) -> bool:
+    return ('A' <= c <= 'Z') or ('a' <= c <= 'z') or ('0' <= c <= '9') or c == '_'
+endfunc
+
+func OCStrParse.IsDigit(c : char) -> bool:
+    return '0' <= c <= '9'
+endfunc
+
+func OCStrParse.IsHexDigit(c : char) -> bool:
+    return ('0' <= c <= '9') or ('A' <= c <= 'F') or ('a' <= c <= 'f')
+endfunc
+
+func OCStrParse.SkipHSpaces():
+    while readp < bufend and (readp^ == ' ' or readp^ == '\t'):
+        ++readp
+    endwhile
+endfunc
+
+func OCStrParse.SkipOneLineEnd() -> bool:
+    result = false
+    if readp < bufend and readp^ == '\r':
+        ++readp
+        result = true
+    endif
+    if readp < bufend and readp^ == '\n':
+        ++readp
+        result = true
+    endif
+endfunc
+
+func OCStrParse.AtLineEnd() -> bool:
+    return readp >= bufend or readp^ == '\n' or readp^ == '\r'
+endfunc
+
+func OCStrParse.CheckSym(sym : rostr, consume : bool = true) -> bool:
+    var saved : ^char = readp
+    if not CheckSymbol(sym):
+        return false
+    endif
+    prevp = saved
+    prevlen = readp - saved
+    if not consume:
+        readp = saved
+    endif
+    return true
+endfunc
+
+func OCStrParse.CheckKeyword(kw : rostr, consume : bool = true) -> bool:
+    var saved : ^char = readp
+    if not CheckSymbol(kw):
+        return false
+    endif
+    if readp < bufend and IsIdentChar(readp^):
+        readp = saved
+        return false
+    endif
+    prevp = saved
+    prevlen = readp - saved
+    if not consume:
+        readp = saved
+    endif
+    return true
+endfunc
+
+func OCStrParse.ReadCIdent(rval : refout str) -> bool:
+    ReadIdentifier(rval)
+    return rval <> ''
+endfunc
+
+func OCStrParse.SkipCLiteral() -> bool:
+    if readp >= bufend or (readp^ <> '"' and readp^ <> '\''):
+        return false
+    endif
+    var quote : char = readp^
+    prevp = readp
+    ++readp
+    while readp < bufend:
+        var c : char = readp^
+        ++readp
+        if c == '\\' and readp < bufend:
+            ++readp
+        elif c == quote:
+            break
+        endif
+    endwhile
+    prevlen = readp - prevp
+    return true
+endfunc
+
+func OCStrParse.ReadCComment(rtext : refout str, is_block : refout bool) -> bool:
+    rtext = ''
+    is_block = false
+    if readp + 1 >= bufend or readp^ <> '/':
+        return false
+    endif
+
+    var nextc : char = (readp + 1)^
+    if nextc == '/':
+        var startp : ^char = readp + 2
+        readp = startp
+        ReadTo('\r\n')
+        rtext = @.TrimSlice(PrevStr())
+        SkipOneLineEnd()
+        return true
+    elif nextc == '*':
+        is_block = true
+        var startp : ^char = readp
+        readp += 2
+        if SearchPattern('*/'):
+            readp += 2
+        else:
+            readp = bufend
+        endif
+        rtext = @.StrSlice(startp, readp - startp)
+        SkipHSpaces()
+        SkipOneLineEnd()
+        return true
+    endif
+
+    return false
+endfunc
+
+func OCStrParse.ReadTrailingComment() -> str:
+    result = ''
+    SkipHSpaces()
+    if readp + 1 < bufend and readp^ == '/':
+        var nextc : char = (readp + 1)^
+        if nextc == '/':
+            readp += 2
+            ReadTo('\r\n')
+            result = @.TrimSlice(PrevStr())
+        elif nextc == '*':
+            readp += 2
+            if SearchPattern('*/'):
+                var cslice : strslice = @.TrimSlice(PrevStr())
+                // Strip leading doxygen markers like !< or *
+                if cslice.StartsWith('!<'):
+                    cslice = @.TrimSlice(@.StrSlice(cslice.pchar + 2, cslice.length - 2))
+                elif cslice.StartsWith('<'):
+                    cslice = @.TrimSlice(@.StrSlice(cslice.pchar + 1, cslice.length - 1))
+                endif
+                result = cslice
+                readp += 2
+            else:
+                readp = bufend
+            endif
+        endif
+    endif
+    SkipHSpaces()
+    SkipOneLineEnd()
+endfunc
+
+func OCStrParse.ReadPreprocRaw() -> str:
+    var startp : ^char = readp
+    while readp < bufend:
+        ReadTo('\r\n')
+        var line_end : ^char = readp
+        var checkp : ^char = line_end
+        while checkp > startp and ((checkp - 1)^ == ' ' or (checkp - 1)^ == '\t'):
+            --checkp
+        endwhile
+        var continued : bool = (checkp > startp and (checkp - 1)^ == '\\')
+        SkipOneLineEnd()
+        if not continued:
+            return @.TrimSlice(@.StrSlice(startp, line_end - startp))
+        endif
+    endwhile
+    return @.TrimSlice(@.StrSlice(startp, readp - startp))
+endfunc
+
+func OCStrParse.ReadBalanced(open_ch : char, close_ch : char, rslice : refout strslice) -> bool:
+    rslice = ''
+    if readp >= bufend or readp^ <> open_ch:
+        return false
+    endif
+
+    ++readp
+    var content_start : ^char = readp
+    var depth : int = 1
+
+    while readp < bufend and depth > 0:
+        var c : char = readp^
+        if c == '"' or c == '\'':
+            SkipCLiteral()
+        elif c == '/' and readp + 1 < bufend and (readp + 1)^ == '/':
+            readp += 2
+            ReadTo('\r\n')
+        elif c == '/' and readp + 1 < bufend and (readp + 1)^ == '*':
+            readp += 2
+            if SearchPattern('*/'):
+                readp += 2
+            else:
+                readp = bufend
+            endif
+        else:
+            if c == open_ch:
+                ++depth
+            elif c == close_ch:
+                --depth
+                if depth == 0:
+                    rslice = @.StrSlice(content_start, readp - content_start)
+                    ++readp
+                    return true
+                endif
+            endif
+            ++readp
+        endif
+    endwhile
+
+    return false
+endfunc
+
+func OCStrParse.ReadUntilTopLevel(stopchars : rostr, rslice : refout strslice) -> char:
+    var startp  : ^char = readp
+    var scstart : ^char = stopchars.pchar
+    var scend   : ^char = scstart + stopchars.length
+
+    var paren_depth   : int = 0
+    var bracket_depth : int = 0
+    var brace_depth   : int = 0
+
+    while readp < bufend:
+        var c : char = readp^
+
+        if paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
+            var scp : ^char = scstart
+            while scp < scend:
+                if scp^ == c:
+                    rslice = @.StrSlice(startp, readp - startp)
+                    return c
+                endif
+                ++scp
+            endwhile
+        endif
+
+        if c == '"' or c == '\'':
+            SkipCLiteral()
+        elif c == '/' and readp + 1 < bufend and (readp + 1)^ == '/':
+            readp += 2
+            ReadTo('\r\n')
+        elif c == '/' and readp + 1 < bufend and (readp + 1)^ == '*':
+            readp += 2
+            if SearchPattern('*/'):
+                readp += 2
+            else:
+                readp = bufend
+            endif
+        else:
+            if c == '(':
+                ++paren_depth
+            elif c == ')' and paren_depth > 0:
+                --paren_depth
+            elif c == '[':
+                ++bracket_depth
+            elif c == ']' and bracket_depth > 0:
+                --bracket_depth
+            elif c == '{':
+                ++brace_depth
+            elif c == '}' and brace_depth > 0:
+                --brace_depth
+            endif
+            ++readp
+        endif
+    endwhile
+
+    rslice = @.StrSlice(startp, readp - startp)
+    return char(0)
+endfunc
+
+func OCStrParse.SkipToSafeBoundary(startp : ^char) -> strslice:
+    readp = startp
+    var brace_depth : int = 0
+    var paren_depth : int = 0
+
+    while readp < bufend:
+        var c : char = readp^
+        if c == '"' or c == '\'':
+            SkipCLiteral()
+        elif c == '/' and readp + 1 < bufend and (readp + 1)^ == '/':
+            readp += 2
+            ReadTo('\r\n')
+        elif c == '/' and readp + 1 < bufend and (readp + 1)^ == '*':
+            readp += 2
+            if SearchPattern('*/'):
+                readp += 2
+            else:
+                readp = bufend
+            endif
+        else:
+            if c == '(':
+                ++paren_depth
+            elif c == ')' and paren_depth > 0:
+                --paren_depth
+            elif c == '{':
+                ++brace_depth
+            elif c == '}':
+                if brace_depth > 0:
+                    --brace_depth
+                    if brace_depth == 0 and paren_depth == 0:
+                        ++readp
+                        SkipHSpaces()
+                        if readp < bufend and readp^ == ';':
+                            ++readp
+                        endif
+                        SkipOneLineEnd()
+                        break
+                    endif
+                else:
+                    if readp == startp:
+                        ++readp
+                    endif
+                    break
+                endif
+            elif c == ';' and brace_depth == 0 and paren_depth == 0:
+                ++readp
+                SkipHSpaces()
+                SkipOneLineEnd()
+                break
+            endif
+            ++readp
+        endif
+    endwhile
+
+    if readp <= startp and readp < bufend:
+        ReadLine()
+    endif
+
+    return @.StrSlice(startp, readp - startp)
+endfunc

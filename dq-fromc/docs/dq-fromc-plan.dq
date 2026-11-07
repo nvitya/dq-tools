@@ -1,0 +1,187 @@
+# dq-fromc Implementation Plan
+
+## 1. Goal & Scope
+
+`dq-fromc` is a C/C++ to DQ source code translator written in DQ.
+Its primary purpose is to automate the bulk of migrating existing C/C++ codebases (such as `/workvc/vihal/core/src/` and `/workvc/vihal/arma/RK/src/`) into idiomatic, properly indented DQ source files, minimizing manual migration work.
+
+### Key Design Principles
+1. **Single-File Translation**: Translates one C/C++ source or header file at a time without following `#include` directives or expanding macros across files.
+2. **Direct `OStrParse` -> AST Architecture**: Uses `OStrParse` (`stdpkg/strparse`) directly with a hierarchy of recursive parsing methods to build an AST, without a separate tokenizer stage (matching the DQ compiler and `OJson` design).
+3. **Reusable AST & DQ Emitter**: Separates the C/C++ parser frontend from the AST (`OCodeNode`) and DQ code generator (`AppendToDqStr`), making the AST and emitter reusable for future translators (e.g., Pascal to DQ).
+4. **Guaranteed Fallback (Zero Data Loss)**: Whenever the parser cannot understand a declaration, statement, block, or expression fragment, it must **never drop the code**. Instead, it falls back to copying the original C source slice into an `nkRaw` AST node at the current indentation level.
+5. **Comment & Structure Preservation**: Preserves standalone comments (`//` and `/* ... */`), trailing end-of-line comments, vertical blank lines, and preprocessor directives.
+
+---
+
+## 2. Project Layout
+
+Location: `/workvc/dq-tools/dq-fromc/`
+
+```
+/workvc/dq-tools/dq-fromc/
+├── dq-fromc.dqproj          # DQ project file (main = 'src/main_dqfromc.dq', output = 'dq-fromc')
+├── Makefile                 # Convenience build wrapper calling system-wide `dq-comp`
+├── docs/
+│   └── dq-fromc-plan.dq     # This implementation plan
+└── src/
+    ├── main_dqfromc.dq      # CLI argument parsing, file I/O, entry point
+    ├── code_ast.dq          # Language-independent AST (`OCodeNode`) & DQ code emitter
+    ├── c_strparse.dq        # `OCStrParse(OStrParse)` C-specific parsing helpers
+    └── c_parser.dq          # `OCParser` hierarchical C/C++ -> `OCodeNode` parser & expression translator
+```
+
+---
+
+## 3. Component Design
+
+### 3.1. `src/code_ast.dq` — AST & DQ Code Emitter
+
+#### `NCodeNodeKind` Enum
+- **Container / Structural Nodes:**
+  - `nkRoot`         — Root module/file container
+  - `nkBlock`        — Sequence of statements
+  - `nkClass`        — C++ `class` -> DQ `object Name(Parent): ... endobject`
+  - `nkStruct`       — C `struct` -> DQ `struct Name: ... endstruct`
+  - `nkUnion`        — C `union` -> DQ `union Name: ... endunion`
+  - `nkEnum`         — C `enum` -> DQ `enum Name = ( ... )` or `const(int): ... endconst`
+  - `nkFunc`         — Function or method declaration (`..`) or implementation (`: ... endfunc`)
+- **Declaration Nodes:**
+  - `nkField`        — Struct/object member field (`name : Type = init`)
+  - `nkParam`        — Function parameter (`name : Type = default`)
+  - `nkVarDecl`      — Local or global variable (`var name : Type = init`)
+  - `nkConstDecl`    — `#define` constant or `const` variable (`const NAME :? = val`)
+- **Statement & Control-Flow Nodes:**
+  - `nkIf`           — `if cond:` with `then_block`, `elif_list`, and `else_block` -> `endif`
+  - `nkWhile`        — `while cond: ... endwhile`
+  - `nkDoWhile`      — `while true: ... if not (cond): break endif endwhile`
+  - `nkFor`          — `for` loop (translated to `for i : Type = start ..< limit:` when simple, or `init` + `while cond:` + `step` when general)
+  - `nkSwitch`       — `case expr:` with `nkCaseBranch` (`when val:`) and `else:` -> `endcase`
+  - `nkReturn`       — `return expr`
+  - `nkBreak`        — `break`
+  - `nkContinue`     — `continue`
+  - `nkStmt`         — Single expression or assignment statement
+- **Trivia, Preprocessor & Fallback Nodes:**
+  - `nkEmptyLine`    — Preserves blank lines
+  - `nkComment`      — Standalone single-line or multi-line comment
+  - `nkPreproc`      — `#include`, `#ifdef`, `#ifndef`, `#if`, `#elif`, `#else`, `#endif`, `#pragma`, `#warning`
+  - `nkVisibility`   — `public`, `private`, `protected` section markers inside objects
+  - `nkRaw`          — **Fallback node**: stores unparsed C source text verbatim
+
+#### `OCodeNode` Object
+- Fields:
+  - `kind : NCodeNodeKind`
+  - `name : str` (identifier, function name (`Class.Method`), struct name, etc.)
+  - `type_str : str` (DQ type representation, return type, parent class, etc.)
+  - `expr_str : str` (condition, initializer, return value, statement text, or raw fallback text)
+  - `attr_str : str` (e.g., `[[regrw]]`, `[[regro]]`, `[[regwo]]`, `[[inline]]`)
+  - `comment : str` (trailing same-line comment `// ...`)
+  - `is_forward : bool` (true for prototype/header method declarations ending with `;`)
+  - `children : [*]OCodeNode` (body statements, struct fields, enum items)
+  - `params : [*]OCodeNode` (function parameters or `elif` branches)
+  - `else_children : [*]OCodeNode` (`else` branch statements)
+- Emitter Methods:
+  - `AppendToDqStr(rstr : ref str, indent : str)`
+  - Formats DQ code with 4-space indentation per nesting level.
+  - Appends trailing `comment` on the same line when present.
+  - Emits `nkRaw` nodes re-indented cleanly to the current `indent` so unrecognized C constructs remain readable and in-place.
+
+---
+
+### 3.2. `src/c_strparse.dq` — `OCStrParse(OStrParse)`
+
+Extends `OStrParse` with C-aware low-level helpers while operating directly on `readp` / `bufend`:
+- `SkipHSpaces()`: Skips `' '` and `'\t'` only (does not cross line endings).
+- `SkipToLineEnd()`: Skips horizontal spaces and captures any trailing `// ...` or `/* ... */` comment on the current line.
+- `CheckKeyword(kw : rostr) -> bool`: Matches `kw` at `readp` only if not followed by `[A-Za-z0-9_]`.
+- `CheckOp(op : rostr) -> bool`: Matches multi-char operators safely (e.g., `check '='` does not match `'=='` or `'!='`).
+- `ReadCIdentifier(rval : refout str) -> bool`: Reads `[A-Za-z_][A-Za-z0-9_]*`.
+- `ReadCString() -> bool`: Reads `"..."` or `'...'` handling `\"` and `\'` escapes.
+- `ReadCComment(rcomment : refout str) -> bool`: Reads `//...` or `/*...*/`.
+- `ReadBalanced(open_ch : char, close_ch : char, rslice : refout strslice) -> bool`:
+  - Advances from `open_ch` to the matching `close_ch`, properly skipping nested pairs, string/char literals, and comments.
+- `ReadStatementSlice(rslice : refout strslice) -> bool`:
+  - Reads up to `;` at nesting depth 0 (ignoring `;` inside `(...)` or strings/comments).
+- `SkipToSafeBoundary(startp : ^char) -> strslice`:
+  - **Fallback helper**: When a parse attempt fails, resets to `startp` and advances to the next safe statement/block boundary (`;`, matching `}`, or `\n`), returning the raw `strslice` for an `nkRaw` node. Guaranteed to advance `readp` by at least one character/line to prevent infinite loops.
+
+---
+
+### 3.3. `src/c_parser.dq` — Hierarchical C/C++ Parser (`OCParser`)
+
+#### Top-Level & Block Parsing Hierarchy
+- `ParseFile(c_source : strslice) -> OCodeNode`:
+  - Loops until `sp.readp >= sp.bufend`, dispatching to:
+    1. Blank lines -> `nkEmptyLine`
+    2. Comments (`//` or `/*`) -> `nkComment`
+    3. Preprocessor (`#...`) -> `ParsePreproc()`
+    4. `typedef`, `class`, `struct`, `union`, `enum` -> `ParseTypeDecl()`
+    5. Function definitions / declarations or global variables -> `ParseFuncOrVar()`
+    6. **Fallback**: If none match or parsing fails -> `nkRaw` via `SkipToSafeBoundary()`.
+- `ParseClassOrStruct(sp, parent)`:
+  - Handles `class Name : public Base`, `struct Name`, `typedef struct { ... } Name;`, and nested structs/unions.
+  - Parses `public:` / `private:` / `protected:` labels, field declarations, method prototypes (`func ... ..`), and inline method implementations.
+  - Maps CMSIS/hardware modifiers (`__IO`, `__I`, `__O`, `volatile`) to `[[regrw]]`, `[[regro]]`, `[[regwo]]`.
+- `ParseFuncOrVar(sp, parent)`:
+  - Distinguishes `RetType Class::Method(Params) { ... }`, `RetType Func(Params);`, and `Type varname = init;`.
+  - Converts `Class::Method` to `Class.Method`.
+  - Converts `void` return type to no `->` clause in DQ.
+  - Converts pointer parameters (`char * ach` or `THwDmaTransfer * axfer`) to `ach : ^char` / `axfer : ^THwDmaTransfer`.
+- `ParseBlockOrSingleStmt(sp, block_node)`:
+  - If next token is `{`, reads balanced `{ ... }` and parses all inner statements into `block_node`.
+  - Otherwise, parses a single statement into `block_node` (so C one-liners like `if (!oddparity) tmp |= (1 << 4);` always become valid multi-line DQ `if ... : ... endif` blocks).
+- `ParseStatement(sp, parent)`:
+  - Handles:
+    - `if (...) ... [else if (...) ...] [else ...]` -> single `nkIf` node with `elif` branches (avoiding nested `endif` cascades).
+    - `while (...) ...` -> `nkWhile`
+    - `do { ... } while (...);` -> `nkDoWhile`
+    - `for (init; cond; step) ...` -> `nkFor`
+    - `switch (...) { case ...: default: }` -> `nkSwitch`
+    - `return ...;` -> `nkReturn`
+    - `break;` / `continue;` -> `nkBreak` / `nkContinue`
+    - Empty block `{ }` (e.g., dummy register read `if (regs->LCR) { }`) -> preserved cleanly.
+    - Local variable declaration vs. expression statement (`uint32_t tmp;` or `unsigned brdiv = ...;` vs `regs->LCR = tmp;`).
+    - **Fallback**: Any unrecognized statement is captured into `nkRaw`.
+
+#### Type & Expression Translation (`TranslateType`, `TranslateExpr`)
+- **Type Mapping (`TranslateType`)**:
+  - Standard integers: `uint8_t`/`int8_t`/`uint16_t`/`int16_t`/`uint32_t`/`int32_t`/`uint64_t`/`int64_t` -> `uint8`/`int8`/`uint16`/`int16`/`uint32`/`int32`/`uint64`/`int64`
+  - C built-ins: `unsigned int` / `unsigned` -> `uint`, `unsigned char` -> `uint8`, `unsigned short` -> `uint16`, `unsigned long` -> `uint`
+  - Pointers: `Type *` -> `^Type`, `void *` -> `pointer`, `void **` -> `^pointer`, `const char *` -> `^char` (or `rostr` where appropriate)
+  - Arrays: `char fmtbuf[FMT_BUFFER_SIZE]` -> `fmtbuf : [FMT_BUFFER_SIZE]char`
+- **Expression Rewriting (`TranslateExpr`)**:
+  - Uses `OCStrParse` over the expression slice:
+  - Member access: `a->b` -> `a.b`, `Class::Member` -> `Class.Member`
+  - Logical operators: `&&` -> ` and `, `||` -> ` or `, `!expr` -> `not expr`
+  - Comparison & bitwise: `!=` -> ` <> `, `^` -> ` xor `, `%` -> ` mod `
+  - Pointers: unary `*ptr` -> `ptr^`, unary `&var` -> `%var`, `nullptr` / `NULL` -> `nil`
+  - Casts: `(Type *)expr` -> `^Type(expr)`, `(uint32_t)expr` -> `uint32(expr)`
+  - Number literals: strips C suffixes (`123UL`, `0xFFu`, `1.0f` -> `123`, `0xFF`, `1.0`), converts `0X` -> `0x`
+  - Ternary `cond ? a : b` -> `if cond then a else b` (or left with fallback comment if complex)
+  - Preserves multi-line formatting and inline comments inside parenthesized expressions (such as register bitfield setup blocks in `vihal`).
+
+---
+
+### 3.4. `src/main_dqfromc.dq` — CLI Interface
+
+- Usage:
+  - `dq-fromc <input.c/.cpp/.h>` -> prints translated DQ code to stdout
+  - `dq-fromc <input.c/.cpp/.h> -o <output.dq>` -> writes translated DQ code to `<output.dq>`
+- Compiles with the system-wide `dq-comp` compiler:
+  - `dq-comp dq-fromc.dqproj` (or `dq-comp src/main_dqfromc.dq -o dq-fromc`)
+
+---
+
+## 4. Implementation & Verification Steps
+
+1. **Step 1 — Scaffold Project & AST (`code_ast.dq`)**:
+   - Create `dq-fromc.dqproj` and `src/code_ast.dq` with `OCodeNode` and `AppendToDqStr`.
+2. **Step 2 — Implement `OCStrParse` (`c_strparse.dq`)**:
+   - Implement keyword/operator checks, balanced bracket reader, comment reader, and `SkipToSafeBoundary` fallback.
+3. **Step 3 — Implement `OCParser` (`c_parser.dq`)**:
+   - Implement top-level, class/struct, function, statement, and expression translation with fallback to `nkRaw`.
+4. **Step 4 — Implement CLI (`main_dqfromc.dq`) & Build**:
+   - Compile with system-wide `dq-comp`.
+5. **Step 5 — Test & Refine on VIHAL Sources**:
+   - Test on `/workvc/vihal/arma/RK/src/` (`hwuart_rk.h`, `hwuart_rk.cpp`, `hwpins_rk.cpp`, `hwclk_rk.cpp`, etc.) and `/workvc/vihal/core/src/` (`hwuart.h`, `hwuart.cpp`, `hwpins.h`, etc.).
+   - Verify that all C/C++ constructs in VIHAL translate cleanly, indentation conforms to DQ style, and any unparsed constructs fall back intact via `nkRaw`.

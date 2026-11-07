@@ -1,0 +1,587 @@
+/*
+ * file:    code_ast.dq
+ * brief:   Language-independent AST and DQ source code emitter
+ */
+
+enum NCodeNodeKind =
+(
+    nkRoot,
+    nkBlock,
+    nkClass,
+    nkStruct,
+    nkUnion,
+    nkEnum,
+    nkFunc,
+    nkField,
+    nkParam,
+    nkVarDecl,
+    nkConstDecl,
+    nkIf,
+    nkElif,
+    nkWhile,
+    nkDoWhile,
+    nkFor,
+    nkSwitch,
+    nkCaseBranch,
+    nkReturn,
+    nkBreak,
+    nkContinue,
+    nkStmt,
+    nkEmptyLine,
+    nkComment,
+    nkPreproc,
+    nkVisibility,
+    nkRaw
+)
+
+object OCodeNode:
+public
+    kind          : NCodeNodeKind = nkStmt
+    name          : str = ''
+    type_str      : str = ''
+    expr_str      : str = ''
+    attr_str      : str = ''
+    comment       : str = ''
+    is_forward    : bool = false
+
+    children      : [*]OCodeNode
+    params        : [*]OCodeNode
+    else_children : [*]OCodeNode
+
+    func *Create()                                [[overload]] ..
+    func *Create(akind : NCodeNodeKind)           [[overload]] ..
+
+    func AddChild(akind : NCodeNodeKind) -> OCodeNode  [[overload]] ..
+    func AddChild(anode : OCodeNode) -> OCodeNode      [[overload]] ..
+    func AddParam(akind : NCodeNodeKind) -> OCodeNode  ..
+    func AddElseChild(akind : NCodeNodeKind) -> OCodeNode ..
+
+    func AppendComment(rstr : ref str) ..
+    func AppendRPad(rstr : ref str, text : strslice, target_len : int) ..
+    func AppendExpr(rstr : ref str, text : strslice, cont_indent : str) ..
+    func AppendBlock(rstr : ref str, list : ref [*]OCodeNode, indent : str) ..
+    func AppendIndentedText(rstr : ref str, text : strslice, indent : str) ..
+    func AppendToDqStr(rstr : ref str, indent : str) ..
+    func ToDqStr() -> str ..
+endobject
+
+implementation
+
+func OCodeNode.*Create()  [[overload]]:
+    name = ''
+    type_str = ''
+    expr_str = ''
+    attr_str = ''
+    comment = ''
+    children = []
+    params = []
+    else_children = []
+endfunc
+
+func OCodeNode.*Create(akind : NCodeNodeKind)  [[overload]]:
+    kind = akind
+    name = ''
+    type_str = ''
+    expr_str = ''
+    attr_str = ''
+    comment = ''
+    children = []
+    params = []
+    else_children = []
+endfunc
+
+func OCodeNode.AddChild(akind : NCodeNodeKind) -> OCodeNode  [[overload]]:
+    result = new OCodeNode(akind)
+    children.Append(result)
+endfunc
+
+func OCodeNode.AddChild(anode : OCodeNode) -> OCodeNode  [[overload]]:
+    result = anode
+    children.Append(anode)
+endfunc
+
+func OCodeNode.AddParam(akind : NCodeNodeKind) -> OCodeNode:
+    result = new OCodeNode(akind)
+    params.Append(result)
+endfunc
+
+func OCodeNode.AddElseChild(akind : NCodeNodeKind) -> OCodeNode:
+    result = new OCodeNode(akind)
+    else_children.Append(result)
+endfunc
+
+func OCodeNode.AppendComment(rstr : ref str):
+    if comment <> '':
+        rstr.Add('  // ')
+        rstr.Add(comment)
+    endif
+endfunc
+
+func OCodeNode.AppendRPad(rstr : ref str, text : strslice, target_len : int):
+    rstr.Add(text)
+    var pad : int = target_len - text.length
+    while pad > 0:
+        rstr.Add(' ')
+        --pad
+    endwhile
+endfunc
+
+func OCodeNode.AppendExpr(rstr : ref str, text : strslice, cont_indent : str):
+    if not text.Contains('\n'):
+        rstr.Add(text)
+        return
+    endif
+
+    var cp     : ^char = text.pchar
+    var endp   : ^char = cp + text.length
+    var lstart : ^char = cp
+    var first  : bool  = true
+
+    while cp < endp:
+        if cp^ == '\n':
+            var llen : int = cp - lstart
+            if llen > 0 and (lstart + llen - 1)^ == '\r':
+                --llen
+            endif
+            var lslice : strslice = @.StrSlice(lstart, llen)
+            while lslice.length > 0 and (lslice[0] == ' ' or lslice[0] == '\t'):
+                lslice = @.StrSlice(lslice.pchar + 1, lslice.length - 1)
+            endwhile
+            if lslice.length > 0:
+                if not first:
+                    rstr.Add('\n')
+                    rstr.Add(cont_indent)
+                endif
+                rstr.Add(lslice)
+                first = false
+            endif
+            ++cp
+            lstart = cp
+        else:
+            ++cp
+        endif
+    endwhile
+
+    if lstart < endp:
+        var rslice : strslice = @.StrSlice(lstart, endp - lstart)
+        while rslice.length > 0 and (rslice[0] == ' ' or rslice[0] == '\t'):
+            rslice = @.StrSlice(rslice.pchar + 1, rslice.length - 1)
+        endwhile
+        if rslice.length > 0:
+            if not first:
+                rstr.Add('\n')
+                rstr.Add(cont_indent)
+            endif
+            rstr.Add(rslice)
+        endif
+    endif
+endfunc
+
+func OCodeNode.AppendBlock(rstr : ref str, list : ref [*]OCodeNode, indent : str):
+    for i : int = 0  count list.length:
+        list[i].AppendToDqStr(rstr, indent)
+    endfor
+endfunc
+
+func OCodeNode.AppendIndentedText(rstr : ref str, text : strslice, indent : str):
+    var cp   : ^char = text.pchar
+    var endp : ^char = cp + text.length
+    var line_start : ^char = cp
+
+    while cp < endp:
+        if cp^ == '\n':
+            var llen : int = cp - line_start
+            if llen > 0 and (line_start + llen - 1)^ == '\r':
+                --llen
+            endif
+            var line_slice : strslice = @.StrSlice(line_start, llen)
+            while line_slice.length > 0 and (line_slice[0] == ' ' or line_slice[0] == '\t'):
+                line_slice = @.StrSlice(line_slice.pchar + 1, line_slice.length - 1)
+            endwhile
+            if line_slice.length > 0:
+                rstr.Add(indent)
+                rstr.Add(line_slice)
+            endif
+            rstr.Add('\n')
+            ++cp
+            line_start = cp
+        else:
+            ++cp
+        endif
+    endwhile
+
+    if line_start < endp:
+        var rem_slice : strslice = @.StrSlice(line_start, endp - line_start)
+        while rem_slice.length > 0 and (rem_slice[0] == ' ' or rem_slice[0] == '\t' or rem_slice[0] == '\r' or rem_slice[0] == '\n'):
+            rem_slice = @.StrSlice(rem_slice.pchar + 1, rem_slice.length - 1)
+        endwhile
+        if rem_slice.length > 0:
+            rstr.Add(indent)
+            rstr.Add(rem_slice)
+            rstr.Add('\n')
+        endif
+    endif
+endfunc
+
+func OCodeNode.AppendToDqStr(rstr : ref str, indent : str):
+    var sub_indent : str = indent + '    '
+
+    if kind == nkRoot or kind == nkBlock:
+        AppendBlock(rstr, children, indent)
+
+    elif kind == nkEmptyLine:
+        rstr.Add('\n')
+
+    elif kind == nkComment:
+        if expr_str.StartsWith('/*'):
+            rstr.Add(indent)
+            rstr.Add(expr_str)
+            rstr.Add('\n')
+        else:
+            rstr.Add(indent)
+            rstr.Add('//')
+            if expr_str <> '' and not expr_str.StartsWith(' ') and not expr_str.StartsWith('/'):
+                rstr.Add(' ')
+            endif
+            rstr.Add(expr_str)
+            rstr.Add('\n')
+        endif
+
+    elif kind == nkPreproc:
+        rstr.Add(indent)
+        rstr.Add(expr_str)
+        AppendComment(rstr)
+        rstr.Add('\n')
+
+    elif kind == nkVisibility:
+        var vis_indent : str = indent
+        if vis_indent.length >= 4:
+            vis_indent = @.StrSlice(vis_indent.pchar, vis_indent.length - 4)
+        endif
+        rstr.Add(vis_indent)
+        rstr.Add(name)
+        AppendComment(rstr)
+        rstr.Add('\n')
+
+    elif kind == nkConstDecl:
+        rstr.Add(indent)
+        rstr.Add('const ')
+        AppendRPad(rstr, name, 20)
+        if type_str <> '':
+            rstr.Add(' : ')
+            rstr.Add(type_str)
+        else:
+            rstr.Add(' :?')
+        endif
+        if expr_str <> '':
+            rstr.Add(' = ')
+            rstr.Add(expr_str)
+        endif
+        AppendComment(rstr)
+        rstr.Add('\n')
+
+    elif kind == nkClass:
+        rstr.Add(indent)
+        rstr.Add('object ')
+        rstr.Add(name)
+        if type_str <> '':
+            rstr.Add('(')
+            rstr.Add(type_str)
+            rstr.Add(')')
+        endif
+        rstr.Add(':')
+        AppendComment(rstr)
+        rstr.Add('\n')
+        AppendBlock(rstr, children, sub_indent)
+        rstr.Add(indent)
+        rstr.Add('endobject\n')
+
+    elif kind == nkStruct:
+        rstr.Add(indent)
+        rstr.Add('struct ')
+        rstr.Add(name)
+        rstr.Add(':')
+        AppendComment(rstr)
+        rstr.Add('\n')
+        AppendBlock(rstr, children, sub_indent)
+        rstr.Add(indent)
+        rstr.Add('endstruct\n')
+
+    elif kind == nkUnion:
+        rstr.Add(indent)
+        rstr.Add('union ')
+        rstr.Add(name)
+        rstr.Add(':')
+        AppendComment(rstr)
+        rstr.Add('\n')
+        AppendBlock(rstr, children, sub_indent)
+        rstr.Add(indent)
+        rstr.Add('endunion\n')
+
+    elif kind == nkEnum:
+        rstr.Add(indent)
+        rstr.Add('enum ')
+        rstr.Add(name)
+        rstr.Add(' =\n')
+        rstr.Add(indent)
+        rstr.Add('(\n')
+        for i : int = 0  count children.length:
+            var item : OCodeNode = children[i]
+            rstr.Add(sub_indent)
+            rstr.Add(item.name)
+            if item.expr_str <> '':
+                rstr.Add(' = ')
+                rstr.Add(item.expr_str)
+            endif
+            if i + 1 < children.length:
+                rstr.Add(',')
+            endif
+            item.AppendComment(rstr)
+            rstr.Add('\n')
+        endfor
+        rstr.Add(indent)
+        rstr.Add(')\n')
+
+    elif kind == nkField:
+        rstr.Add(indent)
+        AppendRPad(rstr, name, 16)
+        rstr.Add(' : ')
+        if attr_str <> '':
+            rstr.Add(attr_str)
+            rstr.Add(' ')
+        endif
+        rstr.Add(type_str)
+        if expr_str <> '':
+            rstr.Add(' = ')
+            AppendExpr(rstr, expr_str, sub_indent)
+        endif
+        AppendComment(rstr)
+        rstr.Add('\n')
+
+    elif kind == nkVarDecl:
+        rstr.Add(indent)
+        if attr_str == 'const':
+            rstr.Add('const ')
+        else:
+            rstr.Add('var ')
+        endif
+        rstr.Add(name)
+        if type_str <> '':
+            rstr.Add(' : ')
+            rstr.Add(type_str)
+        endif
+        if expr_str <> '':
+            rstr.Add(' = ')
+            AppendExpr(rstr, expr_str, sub_indent)
+        endif
+        AppendComment(rstr)
+        rstr.Add('\n')
+
+    elif kind == nkFunc:
+        rstr.Add(indent)
+        rstr.Add('func ')
+        rstr.Add(name)
+        rstr.Add('(')
+        for i : int = 0  count params.length:
+            var p : OCodeNode = params[i]
+            if i > 0:
+                rstr.Add(', ')
+            endif
+            if p.name == '...':
+                rstr.Add('...')
+            else:
+                rstr.Add(p.name)
+                if p.type_str <> '':
+                    rstr.Add(' : ')
+                    rstr.Add(p.type_str)
+                endif
+                if p.expr_str <> '':
+                    rstr.Add(' = ')
+                    rstr.Add(p.expr_str)
+                endif
+            endif
+        endfor
+        rstr.Add(')')
+        if type_str <> '' and type_str <> 'void':
+            rstr.Add(' -> ')
+            rstr.Add(type_str)
+        endif
+        if attr_str <> '':
+            rstr.Add('  ')
+            rstr.Add(attr_str)
+        endif
+        if is_forward:
+            rstr.Add(' ..')
+            AppendComment(rstr)
+            rstr.Add('\n')
+        else:
+            rstr.Add(':')
+            AppendComment(rstr)
+            rstr.Add('\n')
+            AppendBlock(rstr, children, sub_indent)
+            rstr.Add(indent)
+            rstr.Add('endfunc\n')
+        endif
+
+    elif kind == nkIf:
+        rstr.Add(indent)
+        rstr.Add('if ')
+        rstr.Add(expr_str)
+        rstr.Add(':')
+        AppendComment(rstr)
+        rstr.Add('\n')
+        AppendBlock(rstr, children, sub_indent)
+        for i : int = 0  count params.length:
+            var ebr : OCodeNode = params[i]
+            rstr.Add(indent)
+            rstr.Add('elif ')
+            rstr.Add(ebr.expr_str)
+            rstr.Add(':')
+            ebr.AppendComment(rstr)
+            rstr.Add('\n')
+            AppendBlock(rstr, ebr.children, sub_indent)
+        endfor
+        if else_children.length > 0:
+            rstr.Add(indent)
+            rstr.Add('else:\n')
+            AppendBlock(rstr, else_children, sub_indent)
+        endif
+        rstr.Add(indent)
+        rstr.Add('endif\n')
+
+    elif kind == nkWhile:
+        rstr.Add(indent)
+        rstr.Add('while ')
+        rstr.Add(expr_str)
+        rstr.Add(':')
+        AppendComment(rstr)
+        rstr.Add('\n')
+        AppendBlock(rstr, children, sub_indent)
+        rstr.Add(indent)
+        rstr.Add('endwhile\n')
+
+    elif kind == nkDoWhile:
+        rstr.Add(indent)
+        rstr.Add('while true:\n')
+        AppendBlock(rstr, children, sub_indent)
+        rstr.Add(sub_indent)
+        rstr.Add('if not (')
+        rstr.Add(expr_str)
+        rstr.Add('):\n')
+        rstr.Add(sub_indent)
+        rstr.Add('    break\n')
+        rstr.Add(sub_indent)
+        rstr.Add('endif\n')
+        rstr.Add(indent)
+        rstr.Add('endwhile\n')
+
+    elif kind == nkFor:
+        if name <> '':
+            rstr.Add(indent)
+            rstr.Add('for ')
+            rstr.Add(name)
+            if type_str <> '':
+                rstr.Add(' : ')
+                rstr.Add(type_str)
+            endif
+            rstr.Add(' = ')
+            rstr.Add(expr_str)
+            rstr.Add(':')
+            AppendComment(rstr)
+            rstr.Add('\n')
+            AppendBlock(rstr, children, sub_indent)
+            rstr.Add(indent)
+            rstr.Add('endfor\n')
+        else:
+            if type_str <> '':
+                rstr.Add(indent)
+                rstr.Add(type_str)
+                rstr.Add('\n')
+            endif
+            rstr.Add(indent)
+            rstr.Add('while ')
+            if expr_str <> '':
+                rstr.Add(expr_str)
+            else:
+                rstr.Add('true')
+            endif
+            rstr.Add(':')
+            AppendComment(rstr)
+            rstr.Add('\n')
+            AppendBlock(rstr, children, sub_indent)
+            if attr_str <> '':
+                rstr.Add(sub_indent)
+                rstr.Add(attr_str)
+                rstr.Add('\n')
+            endif
+            rstr.Add(indent)
+            rstr.Add('endwhile\n')
+        endif
+
+    elif kind == nkSwitch:
+        if children.length == 0:
+            rstr.Add(indent)
+            rstr.Add('// switch (')
+            rstr.Add(expr_str)
+            rstr.Add(')\n')
+        else:
+            for i : int = 0  count children.length:
+                var br : OCodeNode = children[i]
+                rstr.Add(indent)
+                if br.expr_str == 'default' or br.expr_str == '':
+                    rstr.Add('else:')
+                else:
+                    if i == 0:
+                        rstr.Add('if ')
+                    else:
+                        rstr.Add('elif ')
+                    endif
+                    rstr.Add(br.expr_str)
+                    rstr.Add(':')
+                endif
+                br.AppendComment(rstr)
+                rstr.Add('\n')
+                AppendBlock(rstr, br.children, sub_indent)
+            endfor
+            rstr.Add(indent)
+            rstr.Add('endif\n')
+        endif
+
+    elif kind == nkReturn:
+        rstr.Add(indent)
+        rstr.Add('return')
+        if expr_str <> '':
+            rstr.Add(' ')
+            rstr.Add(expr_str)
+        endif
+        AppendComment(rstr)
+        rstr.Add('\n')
+
+    elif kind == nkBreak:
+        rstr.Add(indent)
+        rstr.Add('break')
+        AppendComment(rstr)
+        rstr.Add('\n')
+
+    elif kind == nkContinue:
+        rstr.Add(indent)
+        rstr.Add('continue')
+        AppendComment(rstr)
+        rstr.Add('\n')
+
+    elif kind == nkStmt:
+        rstr.Add(indent)
+        AppendExpr(rstr, expr_str, sub_indent)
+        AppendComment(rstr)
+        rstr.Add('\n')
+
+    elif kind == nkRaw:
+        AppendIndentedText(rstr, expr_str, indent)
+
+    endif
+endfunc
+
+func OCodeNode.ToDqStr() -> str:
+    result = ''
+    AppendToDqStr(result, '')
+endfunc

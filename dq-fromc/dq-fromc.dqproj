@@ -1,0 +1,2 @@
+main = 'src/main_dqfromc.dq'
+output = 'dq-fromc'

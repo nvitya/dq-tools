@@ -1,0 +1,2012 @@
+/*
+ * file:    c_parser.dq
+ * brief:   Hierarchical C/C++ to DQ AST parser using OCStrParse
+ */
+
+use strparse
+use ./code_ast
+use ./c_strparse
+
+object OCParser:
+public
+    func *Create() ..
+    func TrimSlice(s : strslice) -> strslice ..
+
+    func ParseFile(c_source : strslice) -> OCodeNode ..
+
+    func ParseTopLevel(sp : OCStrParse, parent : OCodeNode) ..
+    func ParseCommentsAndBlankLines(sp : OCStrParse, parent : OCodeNode) -> bool ..
+    func ParsePreproc(sp : OCStrParse, parent : OCodeNode) ..
+
+    func ParseTypedef(sp : OCStrParse, parent : OCodeNode) -> bool ..
+    func ParseClassOrStruct(sp : OCStrParse, parent : OCodeNode, akind : NCodeNodeKind, is_typedef : bool) -> bool ..
+    func ParseClassBody(sp : OCStrParse, cls_node : OCodeNode) ..
+    func ParseEnum(sp : OCStrParse, parent : OCodeNode, is_typedef : bool) -> bool ..
+
+    func ParseMemberOrTopDecl(sp : OCStrParse, parent : OCodeNode, in_class : bool) -> bool ..
+    func ParseParamList(param_slice : strslice, func_node : OCodeNode) ..
+    func ParseSingleParam(pslice : strslice, func_node : OCodeNode) ..
+
+    func TrimEmptyLines(list : ref [*]OCodeNode) ..
+    func ParseBlock(body_slice : strslice, parent_list : ref [*]OCodeNode) ..
+    func ParseBlockOrSingleStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) ..
+    func ParseStatement(sp : OCStrParse, parent_list : ref [*]OCodeNode) ..
+
+    func ParseIfStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool ..
+    func ParseWhileStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool ..
+    func ParseDoWhileStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool ..
+    func ParseForStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool ..
+    func ParseSwitchStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool ..
+    func ParseSimpleOrDeclStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool ..
+
+    func TrySplitDecl(stmt_slice : strslice, rmod : refout str, rtype : refout str, rrest : refout strslice) -> bool ..
+    func IsLikelyTypeName(w : strslice, has_mod_or_ptr : bool) -> bool ..
+    func IsControlKeyword(w : strslice) -> bool ..
+
+    func TranslateType(raw_type : strslice, ptr_count : int, arr_dims : strslice) -> str ..
+    func MapBaseTypeName(raw_name : strslice) -> str ..
+    func TranslateExpr(expr_slice : strslice) -> str ..
+    func TryParseCast(sp : OCStrParse, rcast_dq : refout str) -> bool ..
+    func ReadPostfixChain(sp : OCStrParse) -> str ..
+endobject
+
+implementation
+
+func OCParser.*Create():
+endfunc
+
+func OCParser.TrimSlice(s : strslice) -> strslice:
+    return @c_strparse.TrimSlice(s)
+endfunc
+
+func OCParser.TrimEmptyLines(list : ref [*]OCodeNode):
+    while list.length > 0 and list[0].kind == nkEmptyLine:
+        list.Delete(0, 1)
+    endwhile
+    while list.length > 0 and list[list.length - 1].kind == nkEmptyLine:
+        list.Delete(list.length - 1, 1)
+    endwhile
+endfunc
+
+func OCParser.ParseFile(c_source : strslice) -> OCodeNode:
+    result = new OCodeNode(nkRoot)
+    var sp <- OCStrParse(c_source)
+
+    while sp.readp < sp.bufend:
+        var saved : ^char = sp.readp
+        ParseTopLevel(sp, result)
+        if sp.readp <= saved and sp.readp < sp.bufend:
+            var raw_slice : strslice = sp.SkipToSafeBoundary(saved)
+            var raw_node : OCodeNode = result.AddChild(nkRaw)
+            raw_node.expr_str = raw_slice
+        endif
+    endwhile
+endfunc
+
+func OCParser.ParseCommentsAndBlankLines(sp : OCStrParse, parent : OCodeNode) -> bool:
+    sp.SkipHSpaces()
+    if sp.readp >= sp.bufend:
+        return true
+    endif
+
+    if sp.readp^ == '\r' or sp.readp^ == '\n':
+        sp.SkipOneLineEnd()
+        if parent.children.length == 0 or parent.children[parent.children.length - 1].kind <> nkEmptyLine:
+            parent.AddChild(nkEmptyLine)
+        endif
+        return true
+    endif
+
+    var ctext : str
+    var is_block : bool
+    if sp.ReadCComment(ctext, is_block):
+        var cnode : OCodeNode = parent.AddChild(nkComment)
+        cnode.expr_str = ctext
+        return true
+    endif
+
+    return false
+endfunc
+
+func OCParser.ParseTopLevel(sp : OCStrParse, parent : OCodeNode):
+    if ParseCommentsAndBlankLines(sp, parent):
+        return
+    endif
+
+    var startp : ^char = sp.readp
+
+    if sp.readp^ == '#':
+        ParsePreproc(sp, parent)
+        return
+    endif
+
+    if sp.CheckKeyword('typedef', false):
+        if ParseTypedef(sp, parent):
+            return
+        endif
+        sp.readp = startp
+    endif
+
+    if sp.CheckKeyword('class', false):
+        if ParseClassOrStruct(sp, parent, nkClass, false):
+            return
+        endif
+        sp.readp = startp
+    endif
+
+    if sp.CheckKeyword('struct', false) or sp.CheckKeyword('union', false):
+        var akind : NCodeNodeKind = nkStruct
+        if sp.CheckKeyword('union', false):
+            akind = nkUnion
+        endif
+        if ParseClassOrStruct(sp, parent, akind, false):
+            return
+        endif
+        sp.readp = startp
+    endif
+
+    if sp.CheckKeyword('enum', false):
+        if ParseEnum(sp, parent, false):
+            return
+        endif
+        sp.readp = startp
+    endif
+
+    if ParseMemberOrTopDecl(sp, parent, false):
+        return
+    endif
+
+    var raw_slice : strslice = sp.SkipToSafeBoundary(startp)
+    var raw_node : OCodeNode = parent.AddChild(nkRaw)
+    raw_node.expr_str = raw_slice
+endfunc
+
+func OCParser.ParsePreproc(sp : OCStrParse, parent : OCodeNode):
+    var raw_line : str = sp.ReadPreprocRaw()
+    var psp <- OCStrParse(raw_line)
+    psp.SkipHSpaces()
+    if psp.readp < psp.bufend and psp.readp^ == '#':
+        ++psp.readp
+    endif
+    psp.SkipHSpaces()
+
+    if psp.CheckKeyword('define'):
+        psp.SkipHSpaces()
+        var def_name : str
+        if psp.ReadCIdent(def_name):
+            // Function-like macro: #define FOO(x) -> keep as nkPreproc
+            if psp.readp < psp.bufend and psp.readp^ == '(':
+                var mnode : OCodeNode = parent.AddChild(nkPreproc)
+                mnode.expr_str = raw_line
+                return
+            endif
+
+            psp.SkipHSpaces()
+            var val_slice : strslice = @.StrSlice(psp.readp, psp.bufend - psp.readp)
+            var val_sp <- OCStrParse(val_slice)
+            var expr_part : strslice
+            val_sp.ReadUntilTopLevel(';', expr_part)
+            var clean_val : str = TrimSlice(expr_part)
+            var trail_comm : str = ''
+
+            var cpos : int = clean_val.IndexOf('//')
+            if cpos >= 0:
+                trail_comm = TrimSlice(@.StrSlice(clean_val.pchar + cpos + 2, clean_val.length - cpos - 2))
+                clean_val = TrimSlice(@.StrSlice(clean_val.pchar, cpos))
+            else:
+                var bpos : int = clean_val.IndexOf('/*')
+                if bpos >= 0:
+                    var bend : int = clean_val.IndexOf('*/')
+                    if bend > bpos:
+                        trail_comm = TrimSlice(@.StrSlice(clean_val.pchar + bpos + 2, bend - bpos - 2))
+                    endif
+                    clean_val = TrimSlice(@.StrSlice(clean_val.pchar, bpos))
+                endif
+            endif
+
+            // Guard macros without values (#define FOO_H_) stay as preprocessor directives
+            if clean_val <> '' and not clean_val.Contains('{') and not clean_val.Contains(';') and not clean_val.Contains('\\'):
+                var cnode : OCodeNode = parent.AddChild(nkConstDecl)
+                cnode.name = def_name
+                cnode.expr_str = TranslateExpr(clean_val)
+                cnode.comment = trail_comm
+                return
+            endif
+        endif
+    endif
+
+    var pnode : OCodeNode = parent.AddChild(nkPreproc)
+    pnode.expr_str = raw_line
+endfunc
+
+func OCParser.ParseTypedef(sp : OCStrParse, parent : OCodeNode) -> bool:
+    if not sp.CheckKeyword('typedef'):
+        return false
+    endif
+    sp.SkipSpaces()
+
+    if sp.CheckKeyword('struct', false):
+        return ParseClassOrStruct(sp, parent, nkStruct, true)
+    elif sp.CheckKeyword('union', false):
+        return ParseClassOrStruct(sp, parent, nkUnion, true)
+    elif sp.CheckKeyword('enum', false):
+        return ParseEnum(sp, parent, true)
+    endif
+
+    var decl_slice : strslice
+    var stopc : char = sp.ReadUntilTopLevel(';', decl_slice)
+    if stopc <> ';':
+        return false
+    endif
+    ++sp.readp
+    var tcomm : str = sp.ReadTrailingComment()
+
+    var dtrim : strslice = TrimSlice(decl_slice)
+    var rmod : str
+    var rtype : str
+    var rrest : strslice
+    if TrySplitDecl(dtrim, rmod, rtype, rrest):
+        var alias_name : str = TrimSlice(rrest)
+        if alias_name <> '' and not alias_name.Contains('('):
+            var snode : OCodeNode = parent.AddChild(nkStmt)
+            snode.expr_str = 'type ' + alias_name + ' = ' + rtype
+            snode.comment = tcomm
+            return true
+        endif
+    endif
+
+    var raw_node : OCodeNode = parent.AddChild(nkRaw)
+    raw_node.expr_str = 'typedef ' + dtrim + ';'
+    return true
+endfunc
+
+func OCParser.ParseClassOrStruct(sp : OCStrParse, parent : OCodeNode, akind : NCodeNodeKind, is_typedef : bool) -> bool:
+    var saved : ^char = sp.readp
+    if akind == nkClass:
+        if not sp.CheckKeyword('class'):
+            return false
+        endif
+    elif akind == nkUnion:
+        if not sp.CheckKeyword('union'):
+            return false
+        endif
+    else:
+        if not sp.CheckKeyword('struct'):
+            return false
+        endif
+    endif
+
+    sp.SkipSpaces()
+    var tag_name : str = ''
+    if sp.ReadCIdent(tag_name):
+        sp.SkipSpaces()
+    endif
+
+    var base_name : str = ''
+    if sp.readp < sp.bufend and sp.readp^ == ':':
+        ++sp.readp
+        sp.SkipSpaces()
+        if sp.CheckKeyword('public') or sp.CheckKeyword('protected') or sp.CheckKeyword('private'):
+            sp.SkipSpaces()
+        endif
+        sp.ReadCIdent(base_name)
+        sp.SkipSpaces()
+    endif
+
+    // Must be followed by '{' to be a class/struct definition (not `struct CRU_REG * ptr`)
+    if sp.readp >= sp.bufend or sp.readp^ <> '{':
+        sp.readp = saved
+        return false
+    endif
+
+    var body_slice : strslice
+    if not sp.ReadBalanced('{', '}', body_slice):
+        sp.readp = saved
+        return false
+    endif
+
+    sp.SkipHSpaces()
+    var after_name : str = ''
+    if sp.ReadCIdent(after_name):
+        sp.SkipHSpaces()
+    endif
+
+    if sp.readp < sp.bufend and sp.readp^ == ';':
+        ++sp.readp
+    endif
+    var tcomm : str = sp.ReadTrailingComment()
+
+    var final_name : str = tag_name
+    if is_typedef and after_name <> '':
+        final_name = after_name
+    elif final_name == '' and after_name <> '':
+        final_name = after_name
+    endif
+    if final_name.EndsWith('_t') and final_name.length > 2:
+        final_name = @.StrSlice(final_name.pchar, final_name.length - 2)
+    endif
+
+    var cnode : OCodeNode = parent.AddChild(akind)
+    cnode.name = final_name
+    cnode.type_str = base_name
+    cnode.comment = tcomm
+
+    var bsp <- OCStrParse(body_slice)
+    ParseClassBody(bsp, cnode)
+    TrimEmptyLines(cnode.children)
+
+    return true
+endfunc
+
+func OCParser.ParseClassBody(sp : OCStrParse, cls_node : OCodeNode):
+    while sp.readp < sp.bufend:
+        if ParseCommentsAndBlankLines(sp, cls_node):
+            continue
+        endif
+
+        var saved : ^char = sp.readp
+
+        if sp.readp^ == '#':
+            ParsePreproc(sp, cls_node)
+            continue
+        endif
+
+        // Check visibility labels: public:, private:, protected:
+        if sp.CheckKeyword('public') or sp.CheckKeyword('private') or sp.CheckKeyword('protected'):
+            var vis_kw : str = sp.PrevStr()
+            if vis_kw == 'protected':
+                vis_kw = 'private'
+            endif
+            sp.SkipHSpaces()
+            if sp.readp < sp.bufend and sp.readp^ == ':':
+                ++sp.readp
+                var vcomm : str = sp.ReadTrailingComment()
+                var vnode : OCodeNode = cls_node.AddChild(nkVisibility)
+                vnode.name = vis_kw
+                vnode.comment = vcomm
+                continue
+            endif
+            sp.readp = saved
+        endif
+
+        if sp.CheckKeyword('struct', false) or sp.CheckKeyword('union', false):
+            var nkind : NCodeNodeKind = nkStruct
+            if sp.CheckKeyword('union', false):
+                nkind = nkUnion
+            endif
+            if ParseClassOrStruct(sp, cls_node, nkind, false):
+                continue
+            endif
+            sp.readp = saved
+        endif
+
+        if sp.CheckKeyword('enum', false):
+            if ParseEnum(sp, cls_node, false):
+                continue
+            endif
+            sp.readp = saved
+        endif
+
+        if ParseMemberOrTopDecl(sp, cls_node, true):
+            continue
+        endif
+
+        var raw_slice : strslice = sp.SkipToSafeBoundary(saved)
+        var raw_node : OCodeNode = cls_node.AddChild(nkRaw)
+        raw_node.expr_str = raw_slice
+    endwhile
+endfunc
+
+func OCParser.ParseEnum(sp : OCStrParse, parent : OCodeNode, is_typedef : bool) -> bool:
+    var saved : ^char = sp.readp
+    if not sp.CheckKeyword('enum'):
+        return false
+    endif
+    sp.SkipSpaces()
+    var tag_name : str = ''
+    if sp.ReadCIdent(tag_name):
+        sp.SkipSpaces()
+    endif
+
+    if sp.readp >= sp.bufend or sp.readp^ <> '{':
+        sp.readp = saved
+        return false
+    endif
+
+    var body_slice : strslice
+    if not sp.ReadBalanced('{', '}', body_slice):
+        sp.readp = saved
+        return false
+    endif
+
+    sp.SkipHSpaces()
+    var after_name : str = ''
+    if sp.ReadCIdent(after_name):
+        sp.SkipHSpaces()
+    endif
+    if sp.readp < sp.bufend and sp.readp^ == ';':
+        ++sp.readp
+    endif
+    var tcomm : str = sp.ReadTrailingComment()
+
+    var final_name : str = tag_name
+    if is_typedef and after_name <> '':
+        final_name = after_name
+    elif final_name == '' and after_name <> '':
+        final_name = after_name
+    endif
+
+    var enode : OCodeNode = parent.AddChild(nkEnum)
+    enode.name = final_name
+    enode.comment = tcomm
+
+    var bsp <- OCStrParse(body_slice)
+    while bsp.readp < bsp.bufend:
+        bsp.SkipSpaces()
+        if bsp.readp >= bsp.bufend:
+            break
+        endif
+        var ctext : str
+        var is_blk : bool
+        if bsp.ReadCComment(ctext, is_blk):
+            continue
+        endif
+
+        var item_name : str
+        if not bsp.ReadCIdent(item_name):
+            break
+        endif
+        bsp.SkipHSpaces()
+        var item_val : str = ''
+        if bsp.readp < bsp.bufend and bsp.readp^ == '=':
+            ++bsp.readp
+            var val_slice : strslice
+            bsp.ReadUntilTopLevel(',\r\n', val_slice)
+            item_val = TranslateExpr(TrimSlice(val_slice))
+        endif
+        bsp.SkipHSpaces()
+        if bsp.readp < bsp.bufend and bsp.readp^ == ',':
+            ++bsp.readp
+        endif
+        var icomm : str = bsp.ReadTrailingComment()
+
+        var inode : OCodeNode = enode.AddChild(nkField)
+        inode.name = item_name
+        inode.expr_str = item_val
+        inode.comment = icomm
+    endwhile
+
+    return true
+endfunc
+
+func OCParser.ParseMemberOrTopDecl(sp : OCStrParse, parent : OCodeNode, in_class : bool) -> bool:
+    var saved : ^char = sp.readp
+    var head_slice : strslice
+    var stopc : char = sp.ReadUntilTopLevel(';{', head_slice)
+    if stopc <> ';' and stopc <> '{':
+        sp.readp = saved
+        return false
+    endif
+
+    var htrim : strslice = TrimSlice(head_slice)
+    if htrim.length == 0:
+        if stopc == ';':
+            ++sp.readp
+            sp.ReadTrailingComment()
+            return true
+        endif
+        sp.readp = saved
+        return false
+    endif
+
+    // Check if this is a function declaration or definition:
+    var hsp <- OCStrParse(htrim)
+    var before_paren : strslice
+    var pstop : char = hsp.ReadUntilTopLevel('(=', before_paren)
+    while pstop == '(' and TrimSlice(before_paren).EndsWith('__attribute__'):
+        var skip_attr : strslice
+        if not hsp.ReadBalanced('(', ')', skip_attr):
+            break
+        endif
+        var dummy_slice : strslice
+        pstop = hsp.ReadUntilTopLevel('(=', dummy_slice)
+        before_paren = @.StrSlice(htrim.pchar, hsp.readp - htrim.pchar)
+    endwhile
+
+    if pstop == '(':
+        var param_slice : strslice
+        if hsp.ReadBalanced('(', ')', param_slice):
+            hsp.SkipSpaces()
+            while hsp.CheckKeyword('const') or hsp.CheckKeyword('override') or hsp.CheckKeyword('noexcept'):
+                hsp.SkipSpaces()
+            endwhile
+
+            if hsp.readp >= hsp.bufend:
+                var rmod : str
+                var rtype : str
+                var fname_slice : strslice
+                var btrim : strslice = TrimSlice(before_paren)
+                var func_name : str = ''
+                var ret_type : str = ''
+
+                if TrySplitDecl(btrim, rmod, rtype, fname_slice):
+                    ret_type = rtype
+                    func_name = TrimSlice(fname_slice)
+                else:
+                    func_name = btrim
+                endif
+
+                // Strip leading '*' from func_name if attached (e.g. `void *GetRegs`)
+                var fsp <- OCStrParse(func_name)
+                var extra_ptrs : int = 0
+                fsp.SkipHSpaces()
+                while fsp.readp < fsp.bufend and fsp.readp^ == '*':
+                    ++extra_ptrs
+                    ++fsp.readp
+                    fsp.SkipHSpaces()
+                endwhile
+                if extra_ptrs > 0:
+                    var clean_fname : str = TrimSlice(@.StrSlice(fsp.readp, fsp.bufend - fsp.readp))
+                    func_name = clean_fname
+                    ret_type = TranslateType(ret_type, extra_ptrs, '')
+                endif
+
+                // Replace `Class::Method` with `Class.Method` (and C++ ctor/dtor with *Create/*Destroy)
+                var dcolon : int = func_name.IndexOf('::')
+                if dcolon >= 0:
+                    var cls_part : str = TrimSlice(@.StrSlice(func_name.pchar, dcolon))
+                    var mth_part : str = TrimSlice(@.StrSlice(func_name.pchar + dcolon + 2, func_name.length - dcolon - 2))
+                    if mth_part == cls_part:
+                        mth_part = '*Create'
+                    elif mth_part == '~' + cls_part:
+                        mth_part = '*Destroy'
+                    endif
+                    func_name = cls_part + '.' + mth_part
+                elif in_class and parent.name <> '':
+                    if func_name == parent.name:
+                        func_name = '*Create'
+                    elif func_name == '~' + parent.name:
+                        func_name = '*Destroy'
+                    endif
+                endif
+
+                if func_name <> '':
+                    var fnode : OCodeNode = parent.AddChild(nkFunc)
+                    fnode.name = func_name
+                    fnode.type_str = ret_type
+                    ParseParamList(param_slice, fnode)
+
+                    if stopc == ';':
+                        ++sp.readp
+                        fnode.is_forward = true
+                        fnode.comment = sp.ReadTrailingComment()
+                        return true
+                    elif stopc == '{':
+                        var body_slice : strslice
+                        if not sp.ReadBalanced('{', '}', body_slice):
+                            sp.readp = saved
+                            return false
+                        endif
+                        fnode.is_forward = false
+                        fnode.comment = sp.ReadTrailingComment()
+                        ParseBlock(body_slice, fnode.children)
+                        return true
+                    endif
+                endif
+            endif
+        endif
+    endif
+
+    if stopc == '{':
+        if htrim.Contains('='):
+            var init_brace : strslice
+            if sp.ReadBalanced('{', '}', init_brace):
+                sp.SkipHSpaces()
+                if sp.readp < sp.bufend and sp.readp^ == ';':
+                    var full_decl : strslice = TrimSlice(@.StrSlice(saved, sp.readp - saved))
+                    ++sp.readp
+                    var tcomm : str = sp.ReadTrailingComment()
+                    var dmod : str
+                    var dtype : str
+                    var drest : strslice
+                    if TrySplitDecl(full_decl, dmod, dtype, drest):
+                        var eqpos : int = drest.IndexOf('=')
+                        if eqpos > 0:
+                            var lhs : strslice = TrimSlice(@.StrSlice(drest.pchar, eqpos))
+                            var vname : str = lhs
+                            var arr_part : strslice = ''
+                            var brk : int = lhs.IndexOf('[')
+                            if brk > 0:
+                                vname = TrimSlice(@.StrSlice(lhs.pchar, brk))
+                                arr_part = TrimSlice(@.StrSlice(lhs.pchar + brk, lhs.length - brk))
+                            endif
+                            var dkind : NCodeNodeKind = nkVarDecl
+                            if in_class:
+                                dkind = nkField
+                            endif
+                            var vnode : OCodeNode = parent.AddChild(dkind)
+                            vnode.name = vname
+                            vnode.type_str = TranslateType(dtype, 0, arr_part)
+                            var ib_expr : str = TranslateExpr(TrimSlice(init_brace))
+                            vnode.expr_str = '[' + ib_expr + ']'
+                            vnode.comment = tcomm
+                            return true
+                        endif
+                    endif
+                endif
+            endif
+        endif
+        sp.readp = saved
+        return false
+    endif
+
+    // stopc == ';' -> Field or global variable declaration
+    ++sp.readp
+    var fcomm : str = sp.ReadTrailingComment()
+
+    var fmod : str
+    var ftype : str
+    var frest : strslice
+    if TrySplitDecl(htrim, fmod, ftype, frest):
+        var rsp <- OCStrParse(frest)
+        var added_any : bool = false
+        while rsp.readp < rsp.bufend:
+            var item_slice : strslice
+            var sep : char = rsp.ReadUntilTopLevel(',', item_slice)
+            if sep == ',':
+                ++rsp.readp
+            endif
+            var itrim : strslice = TrimSlice(item_slice)
+            if itrim.length == 0:
+                continue
+            endif
+
+            var ptrs : int = 0
+            var isp <- OCStrParse(itrim)
+            isp.SkipHSpaces()
+            while isp.readp < isp.bufend and isp.readp^ == '*':
+                ++ptrs
+                ++isp.readp
+                isp.SkipHSpaces()
+            endwhile
+
+            var vname : str
+            if not isp.ReadCIdent(vname):
+                added_any = false
+                break
+            endif
+
+            isp.SkipHSpaces()
+            var arr_dims : str = ''
+            while isp.readp < isp.bufend and isp.readp^ == '[':
+                var dim_slice : strslice
+                if isp.ReadBalanced('[', ']', dim_slice):
+                    var dim_expr : str = TranslateExpr(TrimSlice(dim_slice))
+                    arr_dims += '[' + dim_expr + ']'
+                else:
+                    break
+                endif
+                isp.SkipHSpaces()
+            endwhile
+
+            var init_expr : str = ''
+            if isp.readp < isp.bufend and isp.readp^ == '=':
+                ++isp.readp
+                var init_raw : strslice = TrimSlice(@.StrSlice(isp.readp, isp.bufend - isp.readp))
+                init_expr = TranslateExpr(init_raw)
+            endif
+
+            var dkind : NCodeNodeKind = nkVarDecl
+            if in_class:
+                dkind = nkField
+            endif
+            var dnode : OCodeNode = parent.AddChild(dkind)
+            dnode.name = vname
+            dnode.type_str = TranslateType(ftype, ptrs, arr_dims)
+            dnode.expr_str = init_expr
+            if in_class and fmod <> '':
+                dnode.attr_str = fmod
+            elif not in_class and fmod == 'const':
+                dnode.attr_str = 'const'
+            endif
+            dnode.comment = fcomm
+            added_any = true
+        endwhile
+
+        if added_any:
+            return true
+        endif
+    endif
+
+    sp.readp = saved
+    return false
+endfunc
+
+func OCParser.ParseParamList(param_slice : strslice, func_node : OCodeNode):
+    var ptrim : strslice = TrimSlice(param_slice)
+    if ptrim.length == 0 or ptrim == 'void':
+        return
+    endif
+
+    var sp <- OCStrParse(ptrim)
+    while sp.readp < sp.bufend:
+        var one_param : strslice
+        var stopc : char = sp.ReadUntilTopLevel(',', one_param)
+        if stopc == ',':
+            ++sp.readp
+        endif
+        ParseSingleParam(TrimSlice(one_param), func_node)
+    endwhile
+endfunc
+
+func OCParser.ParseSingleParam(pslice : strslice, func_node : OCodeNode):
+    if pslice.length == 0:
+        return
+    endif
+    if pslice == '...':
+        var vnode : OCodeNode = func_node.AddParam(nkParam)
+        vnode.name = '...'
+        return
+    endif
+
+    var def_val : str = ''
+    var decl_part : strslice = pslice
+    var eq_sp <- OCStrParse(pslice)
+    var lhs_slice : strslice
+    if eq_sp.ReadUntilTopLevel('=', lhs_slice) == '=':
+        decl_part = TrimSlice(lhs_slice)
+        ++eq_sp.readp
+        def_val = TranslateExpr(TrimSlice(@.StrSlice(eq_sp.readp, eq_sp.bufend - eq_sp.readp)))
+    endif
+
+    var rmod : str
+    var rtype : str
+    var rrest : strslice
+    if TrySplitDecl(decl_part, rmod, rtype, rrest):
+        var isp <- OCStrParse(rrest)
+        var ptrs : int = 0
+        isp.SkipHSpaces()
+        while isp.readp < isp.bufend and isp.readp^ == '*':
+            ++ptrs
+            ++isp.readp
+            isp.SkipHSpaces()
+        endwhile
+        var pname : str = ''
+        isp.ReadCIdent(pname)
+        isp.SkipHSpaces()
+        var arr_dims : str = ''
+        while isp.readp < isp.bufend and isp.readp^ == '[':
+            var dslice : strslice
+            if isp.ReadBalanced('[', ']', dslice):
+                var de : str = TranslateExpr(TrimSlice(dslice))
+                arr_dims += '[' + de + ']'
+            else:
+                break
+            endif
+        endwhile
+
+        var pnode : OCodeNode = func_node.AddParam(nkParam)
+        if pname == '':
+            pname = 'arg'
+        endif
+        pnode.name = pname
+        pnode.type_str = TranslateType(rtype, ptrs, arr_dims)
+        pnode.expr_str = def_val
+    else:
+        var pnode : OCodeNode = func_node.AddParam(nkParam)
+        pnode.name = decl_part
+    endif
+endfunc
+
+func OCParser.ParseBlock(body_slice : strslice, parent_list : ref [*]OCodeNode):
+    var sp <- OCStrParse(body_slice)
+    while sp.readp < sp.bufend:
+        var saved : ^char = sp.readp
+        ParseStatement(sp, parent_list)
+        if sp.readp <= saved and sp.readp < sp.bufend:
+            var raw_slice : strslice = sp.SkipToSafeBoundary(saved)
+            var rnode : OCodeNode = new OCodeNode(nkRaw)
+            rnode.expr_str = raw_slice
+            parent_list.Append(rnode)
+        endif
+    endwhile
+    TrimEmptyLines(parent_list)
+endfunc
+
+func OCParser.ParseBlockOrSingleStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode):
+    sp.SkipSpaces()
+    if sp.readp < sp.bufend and sp.readp^ == '{':
+        var bslice : strslice
+        if sp.ReadBalanced('{', '}', bslice):
+            sp.SkipHSpaces()
+            sp.SkipOneLineEnd()
+            ParseBlock(bslice, parent_list)
+            return
+        endif
+    endif
+    ParseStatement(sp, parent_list)
+    TrimEmptyLines(parent_list)
+endfunc
+
+func OCParser.ParseStatement(sp : OCStrParse, parent_list : ref [*]OCodeNode):
+    sp.SkipHSpaces()
+    if sp.readp >= sp.bufend:
+        return
+    endif
+
+    if sp.readp^ == '\r' or sp.readp^ == '\n':
+        sp.SkipOneLineEnd()
+        if parent_list.length == 0 or parent_list[parent_list.length - 1].kind <> nkEmptyLine:
+            var enode : OCodeNode = new OCodeNode(nkEmptyLine)
+            parent_list.Append(enode)
+        endif
+        return
+    endif
+
+    var ctext : str
+    var is_blk : bool
+    if sp.ReadCComment(ctext, is_blk):
+        var cnode : OCodeNode = new OCodeNode(nkComment)
+        cnode.expr_str = ctext
+        parent_list.Append(cnode)
+        return
+    endif
+
+    var startp : ^char = sp.readp
+
+    if sp.readp^ == '#':
+        var raw_line : str = sp.ReadPreprocRaw()
+        var pnode : OCodeNode = new OCodeNode(nkPreproc)
+        pnode.expr_str = raw_line
+        parent_list.Append(pnode)
+        return
+    endif
+
+    if sp.readp^ == ';':
+        ++sp.readp
+        var sccomm : str = sp.ReadTrailingComment()
+        if sccomm <> '':
+            var cnode : OCodeNode = new OCodeNode(nkComment)
+            cnode.expr_str = sccomm
+            parent_list.Append(cnode)
+        endif
+        return
+    endif
+
+    if sp.readp^ == '{':
+        var inner_slice : strslice
+        if sp.ReadBalanced('{', '}', inner_slice):
+            sp.SkipHSpaces()
+            sp.SkipOneLineEnd()
+            ParseBlock(inner_slice, parent_list)
+            return
+        endif
+    endif
+
+    if sp.CheckKeyword('if', false):
+        if ParseIfStmt(sp, parent_list):
+            return
+        endif
+        sp.readp = startp
+    endif
+
+    if sp.CheckKeyword('while', false):
+        if ParseWhileStmt(sp, parent_list):
+            return
+        endif
+        sp.readp = startp
+    endif
+
+    if sp.CheckKeyword('do', false):
+        if ParseDoWhileStmt(sp, parent_list):
+            return
+        endif
+        sp.readp = startp
+    endif
+
+    if sp.CheckKeyword('for', false):
+        if ParseForStmt(sp, parent_list):
+            return
+        endif
+        sp.readp = startp
+    endif
+
+    if sp.CheckKeyword('switch', false):
+        if ParseSwitchStmt(sp, parent_list):
+            return
+        endif
+        sp.readp = startp
+    endif
+
+    if ParseSimpleOrDeclStmt(sp, parent_list):
+        return
+    endif
+
+    var raw_slice : strslice = sp.SkipToSafeBoundary(startp)
+    var rnode : OCodeNode = new OCodeNode(nkRaw)
+    rnode.expr_str = raw_slice
+    parent_list.Append(rnode)
+endfunc
+
+func OCParser.ParseIfStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool:
+    if not sp.CheckKeyword('if'):
+        return false
+    endif
+    sp.SkipSpaces()
+    var cond_slice : strslice
+    if not sp.ReadBalanced('(', ')', cond_slice):
+        return false
+    endif
+    var icomm : str = sp.ReadTrailingComment()
+
+    var if_node : OCodeNode = new OCodeNode(nkIf)
+    if_node.expr_str = TranslateExpr(TrimSlice(cond_slice))
+    if_node.comment = icomm
+    parent_list.Append(if_node)
+
+    ParseBlockOrSingleStmt(sp, if_node.children)
+
+    // Check for `else if` / `else`
+    while true:
+        var saved_after : ^char = sp.readp
+        sp.SkipSpaces()
+        if not sp.CheckKeyword('else'):
+            sp.readp = saved_after
+            break
+        endif
+        sp.SkipSpaces()
+        if sp.CheckKeyword('if'):
+            sp.SkipSpaces()
+            var econd : strslice
+            if not sp.ReadBalanced('(', ')', econd):
+                return true
+            endif
+            var ecomm : str = sp.ReadTrailingComment()
+            var ebr : OCodeNode = if_node.AddParam(nkElif)
+            ebr.expr_str = TranslateExpr(TrimSlice(econd))
+            ebr.comment = ecomm
+            ParseBlockOrSingleStmt(sp, ebr.children)
+        else:
+            var ecomm2 : str = sp.ReadTrailingComment()
+            ParseBlockOrSingleStmt(sp, if_node.else_children)
+            break
+        endif
+    endwhile
+
+    return true
+endfunc
+
+func OCParser.ParseWhileStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool:
+    if not sp.CheckKeyword('while'):
+        return false
+    endif
+    sp.SkipSpaces()
+    var cond_slice : strslice
+    if not sp.ReadBalanced('(', ')', cond_slice):
+        return false
+    endif
+    var wcomm : str = sp.ReadTrailingComment()
+
+    var wnode : OCodeNode = new OCodeNode(nkWhile)
+    wnode.expr_str = TranslateExpr(TrimSlice(cond_slice))
+    wnode.comment = wcomm
+    parent_list.Append(wnode)
+
+    ParseBlockOrSingleStmt(sp, wnode.children)
+    return true
+endfunc
+
+func OCParser.ParseDoWhileStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool:
+    if not sp.CheckKeyword('do'):
+        return false
+    endif
+    var dcomm : str = sp.ReadTrailingComment()
+
+    var dnode : OCodeNode = new OCodeNode(nkDoWhile)
+    dnode.comment = dcomm
+    parent_list.Append(dnode)
+
+    ParseBlockOrSingleStmt(sp, dnode.children)
+
+    sp.SkipSpaces()
+    if sp.CheckKeyword('while'):
+        sp.SkipSpaces()
+        var cond_slice : strslice
+        if sp.ReadBalanced('(', ')', cond_slice):
+            dnode.expr_str = TranslateExpr(TrimSlice(cond_slice))
+            sp.SkipHSpaces()
+            if sp.readp < sp.bufend and sp.readp^ == ';':
+                ++sp.readp
+            endif
+            sp.ReadTrailingComment()
+        endif
+    endif
+    return true
+endfunc
+
+func OCParser.ParseForStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool:
+    if not sp.CheckKeyword('for'):
+        return false
+    endif
+    sp.SkipSpaces()
+    var head_slice : strslice
+    if not sp.ReadBalanced('(', ')', head_slice):
+        return false
+    endif
+    var fcomm : str = sp.ReadTrailingComment()
+
+    var hsp <- OCStrParse(head_slice)
+    var s_init : strslice
+    var s_cond : strslice
+    var s_step : strslice
+
+    if hsp.ReadUntilTopLevel(';', s_init) == ';':
+        ++hsp.readp
+    endif
+    if hsp.ReadUntilTopLevel(';', s_cond) == ';':
+        ++hsp.readp
+    endif
+    s_step = @.StrSlice(hsp.readp, hsp.bufend - hsp.readp)
+
+    var init_trim : strslice = TrimSlice(s_init)
+    var cond_trim : strslice = TrimSlice(s_cond)
+    var step_trim : strslice = TrimSlice(s_step)
+
+    var fnode : OCodeNode = new OCodeNode(nkFor)
+    fnode.comment = fcomm
+
+    var init_dq : str = ''
+    if init_trim.length > 0:
+        var rmod : str
+        var rtype : str
+        var rrest : strslice
+        if TrySplitDecl(init_trim, rmod, rtype, rrest):
+            var eqp : int = rrest.IndexOf('=')
+            if eqp > 0:
+                var vname : str = TrimSlice(@.StrSlice(rrest.pchar, eqp))
+                var vexpr : str = TranslateExpr(TrimSlice(@.StrSlice(rrest.pchar + eqp + 1, rrest.length - eqp - 1)))
+                init_dq = 'var ' + vname + ' : ' + rtype + ' = ' + vexpr
+            else:
+                var vname2 : str = TrimSlice(rrest)
+                init_dq = 'var ' + vname2 + ' : ' + rtype
+            endif
+        else:
+            init_dq = TranslateExpr(init_trim)
+        endif
+    endif
+
+    fnode.type_str = init_dq
+    fnode.expr_str = TranslateExpr(cond_trim)
+    fnode.attr_str = TranslateExpr(step_trim)
+
+    parent_list.Append(fnode)
+    ParseBlockOrSingleStmt(sp, fnode.children)
+    return true
+endfunc
+
+func OCParser.ParseSwitchStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool:
+    if not sp.CheckKeyword('switch'):
+        return false
+    endif
+    sp.SkipSpaces()
+    var cond_slice : strslice
+    if not sp.ReadBalanced('(', ')', cond_slice):
+        return false
+    endif
+    sp.SkipSpaces()
+    var body_slice : strslice
+    if not sp.ReadBalanced('{', '}', body_slice):
+        return false
+    endif
+    var scomm : str = sp.ReadTrailingComment()
+
+    var snode : OCodeNode = new OCodeNode(nkSwitch)
+    snode.expr_str = TranslateExpr(TrimSlice(cond_slice))
+    snode.comment = scomm
+    parent_list.Append(snode)
+
+    var bsp <- OCStrParse(body_slice)
+    var cur_branch : OCodeNode = nil
+
+    while bsp.readp < bsp.bufend:
+        bsp.SkipSpaces()
+        if bsp.readp >= bsp.bufend:
+            break
+        endif
+
+        var ctext : str
+        var is_blk : bool
+        if bsp.ReadCComment(ctext, is_blk):
+            if cur_branch <> nil:
+                var cnode : OCodeNode = cur_branch.AddChild(nkComment)
+                cnode.expr_str = ctext
+            endif
+            continue
+        endif
+
+        if bsp.CheckKeyword('case'):
+            bsp.SkipHSpaces()
+            var val_slice : strslice
+            if bsp.ReadUntilTopLevel(':', val_slice) == ':':
+                ++bsp.readp
+            endif
+            var val_expr : str = TranslateExpr(TrimSlice(val_slice))
+            var bcomm : str = bsp.ReadTrailingComment()
+
+            var cond_cmp : str = snode.expr_str + ' == ' + val_expr
+            if cur_branch <> nil and cur_branch.children.length == 0 and cur_branch.expr_str <> 'default':
+                cur_branch.expr_str += ' or ' + cond_cmp
+            else:
+                cur_branch = snode.AddChild(nkCaseBranch)
+                cur_branch.expr_str = cond_cmp
+                cur_branch.comment = bcomm
+            endif
+            continue
+        elif bsp.CheckKeyword('default'):
+            bsp.SkipHSpaces()
+            if bsp.readp < bsp.bufend and bsp.readp^ == ':':
+                ++bsp.readp
+            endif
+            var dcomm : str = bsp.ReadTrailingComment()
+            cur_branch = snode.AddChild(nkCaseBranch)
+            cur_branch.expr_str = 'default'
+            cur_branch.comment = dcomm
+            continue
+        endif
+
+        if cur_branch == nil:
+            cur_branch = snode.AddChild(nkCaseBranch)
+            cur_branch.expr_str = 'default'
+        endif
+
+        var saved_stmt : ^char = bsp.readp
+        ParseStatement(bsp, cur_branch.children)
+        if bsp.readp <= saved_stmt and bsp.readp < bsp.bufend:
+            var rslice : strslice = bsp.SkipToSafeBoundary(saved_stmt)
+            var rnode : OCodeNode = cur_branch.AddChild(nkRaw)
+            rnode.expr_str = rslice
+        endif
+
+        if cur_branch.children.length > 0 and cur_branch.children[cur_branch.children.length - 1].kind == nkBreak:
+            cur_branch.children.Delete(cur_branch.children.length - 1, 1)
+        endif
+    endwhile
+
+    return true
+endfunc
+
+func OCParser.ParseSimpleOrDeclStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -> bool:
+    var saved : ^char = sp.readp
+
+    if sp.CheckKeyword('return'):
+        sp.SkipHSpaces()
+        var ret_slice : strslice
+        if sp.ReadUntilTopLevel(';', ret_slice) <> ';':
+            sp.readp = saved
+            return false
+        endif
+        ++sp.readp
+        var rcomm : str = sp.ReadTrailingComment()
+        var rnode : OCodeNode = new OCodeNode(nkReturn)
+        rnode.expr_str = TranslateExpr(TrimSlice(ret_slice))
+        rnode.comment = rcomm
+        parent_list.Append(rnode)
+        return true
+    endif
+
+    if sp.CheckKeyword('break'):
+        sp.SkipHSpaces()
+        if sp.readp < sp.bufend and sp.readp^ == ';':
+            ++sp.readp
+            var bcomm : str = sp.ReadTrailingComment()
+            var bnode : OCodeNode = new OCodeNode(nkBreak)
+            bnode.comment = bcomm
+            parent_list.Append(bnode)
+            return true
+        endif
+        sp.readp = saved
+    endif
+
+    if sp.CheckKeyword('continue'):
+        sp.SkipHSpaces()
+        if sp.readp < sp.bufend and sp.readp^ == ';':
+            ++sp.readp
+            var ccomm : str = sp.ReadTrailingComment()
+            var cnode : OCodeNode = new OCodeNode(nkContinue)
+            cnode.comment = ccomm
+            parent_list.Append(cnode)
+            return true
+        endif
+        sp.readp = saved
+    endif
+
+    // Check for array initializer statement like `const uint32_t arr[5] = { ... };`
+    var stmt_slice : strslice
+    var stopc : char = sp.ReadUntilTopLevel(';{', stmt_slice)
+    if stopc == '{' and stmt_slice.Contains('='):
+        var brace_inner : strslice
+        if sp.ReadBalanced('{', '}', brace_inner):
+            sp.SkipHSpaces()
+            if sp.readp < sp.bufend and sp.readp^ == ';':
+                ++sp.readp
+                var acomm : str = sp.ReadTrailingComment()
+                var amod : str
+                var atype : str
+                var arest : strslice
+                if TrySplitDecl(TrimSlice(stmt_slice), amod, atype, arest):
+                    var eqpos : int = arest.IndexOf('=')
+                    if eqpos > 0:
+                        var lhs : strslice = TrimSlice(@.StrSlice(arest.pchar, eqpos))
+                        var vname : str = lhs
+                        var arr_part : strslice = ''
+                        var brk : int = lhs.IndexOf('[')
+                        if brk > 0:
+                            vname = TrimSlice(@.StrSlice(lhs.pchar, brk))
+                            arr_part = TrimSlice(@.StrSlice(lhs.pchar + brk, lhs.length - brk))
+                        endif
+                        var vnode : OCodeNode = new OCodeNode(nkVarDecl)
+                        vnode.name = vname
+                        vnode.type_str = TranslateType(atype, 0, arr_part)
+                        var bi_expr : str = TranslateExpr(TrimSlice(brace_inner))
+                        vnode.expr_str = '[' + bi_expr + ']'
+                        if amod == 'const':
+                            vnode.attr_str = 'const'
+                        endif
+                        vnode.comment = acomm
+                        parent_list.Append(vnode)
+                        return true
+                    endif
+                endif
+            endif
+        endif
+        sp.readp = saved
+        return false
+    endif
+
+    if stopc <> ';':
+        sp.readp = saved
+        return false
+    endif
+
+    ++sp.readp
+    var scomm : str = sp.ReadTrailingComment()
+    var strim : strslice = TrimSlice(stmt_slice)
+
+    var vmod : str
+    var vtype : str
+    var vrest : strslice
+    if TrySplitDecl(strim, vmod, vtype, vrest):
+        var rsp <- OCStrParse(vrest)
+        var decls : [*]OCodeNode
+        var ok : bool = true
+
+        while rsp.readp < rsp.bufend:
+            var item_slice : strslice
+            var sep : char = rsp.ReadUntilTopLevel(',', item_slice)
+            if sep == ',':
+                ++rsp.readp
+            endif
+            var itrim : strslice = TrimSlice(item_slice)
+            if itrim.length == 0:
+                continue
+            endif
+
+            var isp <- OCStrParse(itrim)
+            var ptrs : int = 0
+            isp.SkipHSpaces()
+            while isp.readp < isp.bufend and isp.readp^ == '*':
+                ++ptrs
+                ++isp.readp
+                isp.SkipHSpaces()
+            endwhile
+
+            var vname : str
+            if not isp.ReadCIdent(vname):
+                ok = false
+                break
+            endif
+
+            isp.SkipHSpaces()
+            var arr_dims : str = ''
+            while isp.readp < isp.bufend and isp.readp^ == '[':
+                var dslice : strslice
+                if isp.ReadBalanced('[', ']', dslice):
+                    var de : str = TranslateExpr(TrimSlice(dslice))
+                    arr_dims += '[' + de + ']'
+                else:
+                    break
+                endif
+                isp.SkipHSpaces()
+            endwhile
+
+            var init_expr : str = ''
+            if isp.readp < isp.bufend and isp.readp^ == '=':
+                ++isp.readp
+                var init_raw : strslice = TrimSlice(@.StrSlice(isp.readp, isp.bufend - isp.readp))
+                init_expr = TranslateExpr(init_raw)
+            elif isp.readp < isp.bufend:
+                ok = false
+                break
+            endif
+
+            var vnode : OCodeNode = new OCodeNode(nkVarDecl)
+            vnode.name = vname
+            vnode.type_str = TranslateType(vtype, ptrs, arr_dims)
+            vnode.expr_str = init_expr
+            if vmod == 'const':
+                vnode.attr_str = 'const'
+            endif
+            vnode.comment = scomm
+            decls.Append(vnode)
+        endwhile
+
+        if ok and decls.length > 0:
+            for i : int = 0  count decls.length:
+                parent_list.Append(decls[i])
+            endfor
+            return true
+        endif
+    endif
+
+    var snode : OCodeNode = new OCodeNode(nkStmt)
+    snode.expr_str = TranslateExpr(strim)
+    snode.comment = scomm
+    parent_list.Append(snode)
+    return true
+endfunc
+
+func OCParser.IsControlKeyword(w : strslice) -> bool:
+    return (w == 'if' or w == 'else' or w == 'while' or w == 'for' or w == 'do'
+        or w == 'switch' or w == 'case' or w == 'default' or w == 'return'
+        or w == 'break' or w == 'continue' or w == 'goto' or w == 'sizeof')
+endfunc
+
+func OCParser.IsLikelyTypeName(w : strslice, has_mod_or_ptr : bool) -> bool:
+    if w.length == 0 or IsControlKeyword(w):
+        return false
+    endif
+    if (w == 'int' or w == 'unsigned' or w == 'signed' or w == 'char' or w == 'bool'
+        or w == 'void' or w == 'short' or w == 'long' or w == 'float' or w == 'double'
+        or w == 'size_t' or w == 'ssize_t' or w == 'uintptr_t' or w == 'intptr_t'
+        or w == 'ptrdiff_t' or w == 'va_list'
+        or w == 'uint8_t' or w == 'int8_t' or w == 'uint16_t' or w == 'int16_t'
+        or w == 'uint32_t' or w == 'int32_t' or w == 'uint64_t' or w == 'int64_t'
+        or w == 'uint8' or w == 'int8' or w == 'uint16' or w == 'int16'
+        or w == 'uint32' or w == 'int32' or w == 'uint64' or w == 'int64'):
+        return true
+    endif
+    if w.EndsWith('_t') or w.EndsWith('_REG') or w.EndsWith('Reg') or w.EndsWith('Reg8') or w.EndsWith('Reg16') or w.EndsWith('Reg32'):
+        return true
+    endif
+    if w.StartsWith('T') or w.StartsWith('S') or w.StartsWith('O') or w.StartsWith('E'):
+        if w.length >= 2 and 'A' <= w[1] <= 'Z':
+            return true
+        endif
+    endif
+    if has_mod_or_ptr and 'A' <= w[0] <= 'Z':
+        return true
+    endif
+    return false
+endfunc
+
+func OCParser.TrySplitDecl(stmt_slice : strslice, rmod : refout str, rtype : refout str, rrest : refout strslice) -> bool:
+    rmod = ''
+    rtype = ''
+    rrest = ''
+
+    var sp <- OCStrParse(stmt_slice)
+    sp.SkipHSpaces()
+
+    var has_modifier : bool = false
+    var is_volatile  : bool = false
+    var is_ro        : bool = false
+    var is_wo        : bool = false
+    var is_const     : bool = false
+
+    while sp.readp < sp.bufend:
+        if sp.CheckKeyword('__attribute__'):
+            sp.SkipHSpaces()
+            var attr_inner : strslice
+            sp.ReadBalanced('(', ')', attr_inner)
+            sp.SkipHSpaces()
+        elif sp.CheckKeyword('static') or sp.CheckKeyword('inline') or sp.CheckKeyword('__inline') or sp.CheckKeyword('__STATIC_INLINE') or sp.CheckKeyword('extern'):
+            has_modifier = true
+            sp.SkipHSpaces()
+        elif sp.CheckKeyword('volatile') or sp.CheckKeyword('__IO') or sp.CheckKeyword('__IOM'):
+            has_modifier = true
+            is_volatile = true
+            sp.SkipHSpaces()
+        elif sp.CheckKeyword('__I') or sp.CheckKeyword('__IM'):
+            has_modifier = true
+            is_ro = true
+            sp.SkipHSpaces()
+        elif sp.CheckKeyword('__O') or sp.CheckKeyword('__OM'):
+            has_modifier = true
+            is_wo = true
+            sp.SkipHSpaces()
+        elif sp.CheckKeyword('const'):
+            has_modifier = true
+            is_const = true
+            sp.SkipHSpaces()
+        elif sp.CheckKeyword('struct') or sp.CheckKeyword('union') or sp.CheckKeyword('enum') or sp.CheckKeyword('class'):
+            has_modifier = true
+            sp.SkipHSpaces()
+        else:
+            break
+        endif
+    endwhile
+
+    if is_ro or (is_volatile and is_const):
+        rmod = '[[regro]]'
+    elif is_wo:
+        rmod = '[[regwo]]'
+    elif is_volatile:
+        rmod = '[[regrw]]'
+    elif is_const:
+        rmod = 'const'
+    endif
+
+    var type_words : str = ''
+    if sp.CheckKeyword('unsigned') or sp.CheckKeyword('signed'):
+        type_words = sp.PrevStr()
+        sp.SkipHSpaces()
+        if sp.CheckKeyword('int') or sp.CheckKeyword('char') or sp.CheckKeyword('short') or sp.CheckKeyword('long'):
+            type_words += ' ' + sp.PrevStr()
+            sp.SkipHSpaces()
+            if sp.CheckKeyword('long'):
+                type_words += ' long'
+                sp.SkipHSpaces()
+            endif
+        endif
+    else:
+        var first_word : str
+        if not sp.ReadCIdent(first_word):
+            return false
+        endif
+        if IsControlKeyword(first_word):
+            return false
+        endif
+        type_words = first_word
+        sp.SkipHSpaces()
+    endif
+
+    while sp.CheckKeyword('const') or sp.CheckKeyword('volatile') or sp.CheckKeyword('__attribute__'):
+        if sp.PrevStr() == '__attribute__':
+            sp.SkipHSpaces()
+            var attr_in2 : strslice
+            sp.ReadBalanced('(', ')', attr_in2)
+        endif
+        has_modifier = true
+        sp.SkipHSpaces()
+    endwhile
+
+    var ptr_count : int = 0
+    var is_ref    : bool = false
+    while sp.readp < sp.bufend:
+        if sp.readp^ == '*':
+            ++ptr_count
+            ++sp.readp
+            sp.SkipHSpaces()
+            while sp.CheckKeyword('const') or sp.CheckKeyword('volatile'):
+                sp.SkipHSpaces()
+            endwhile
+        elif sp.readp^ == '&':
+            is_ref = true
+            ++sp.readp
+            sp.SkipHSpaces()
+        else:
+            break
+        endif
+    endwhile
+
+    if sp.readp >= sp.bufend:
+        return false
+    endif
+    if not sp.IsIdentStart(sp.readp^) and sp.readp^ <> '*' and sp.readp^ <> '~':
+        return false
+    endif
+
+    if not IsLikelyTypeName(type_words, has_modifier or ptr_count > 0):
+        var check_sp <- OCStrParse(@.StrSlice(sp.readp, sp.bufend - sp.readp))
+        var next_id : str
+        if not check_sp.ReadCIdent(next_id) or IsControlKeyword(next_id):
+            return false
+        endif
+        check_sp.SkipHSpaces()
+        if check_sp.readp < check_sp.bufend:
+            var nc : char = check_sp.readp^
+            if nc <> '=' and nc <> '[' and nc <> ',' and nc <> '(' and nc <> ':':
+                return false
+            endif
+        endif
+    endif
+
+    rtype = TranslateType(type_words, ptr_count, '')
+    if is_ref:
+        rtype = 'ref ' + rtype
+    endif
+    rrest = TrimSlice(@.StrSlice(sp.readp, sp.bufend - sp.readp))
+    return rrest.length > 0
+endfunc
+
+func OCParser.MapBaseTypeName(raw_name : strslice) -> str:
+    var t : strslice = TrimSlice(raw_name)
+    if t == 'uint8_t' or t == 'unsigned char' or t == '__u8' or t == 'u8':
+        return 'uint8'
+    elif t == 'int8_t' or t == 'signed char' or t == '__s8' or t == 's8':
+        return 'int8'
+    elif t == 'uint16_t' or t == 'unsigned short' or t == '__u16' or t == 'u16':
+        return 'uint16'
+    elif t == 'int16_t' or t == 'short' or t == 'signed short' or t == '__s16' or t == 's16':
+        return 'int16'
+    elif t == 'uint32_t' or t == '__u32' or t == 'u32' or t == 'RoReg' or t == 'RwReg' or t == 'WoReg' or t == 'Reg':
+        return 'uint32'
+    elif t == 'int32_t' or t == '__s32' or t == 's32':
+        return 'int32'
+    elif t == 'uint64_t' or t == 'unsigned long long' or t == '__u64' or t == 'u64':
+        return 'uint64'
+    elif t == 'int64_t' or t == 'long long' or t == 'signed long long' or t == '__s64' or t == 's64':
+        return 'int64'
+    elif t == 'unsigned' or t == 'unsigned int' or t == 'unsigned long' or t == 'size_t' or t == 'uintptr_t':
+        return 'uint'
+    elif t == 'int' or t == 'signed' or t == 'signed int' or t == 'long' or t == 'ssize_t' or t == 'intptr_t' or t == 'ptrdiff_t':
+        return 'int'
+    elif t == 'double':
+        return 'float64'
+    elif t.EndsWith('Reg8'):
+        return 'uint8'
+    elif t.EndsWith('Reg16'):
+        return 'uint16'
+    elif t.EndsWith('Reg32'):
+        return 'uint32'
+    elif t.EndsWith('Reg64'):
+        return 'uint64'
+    elif t.EndsWith('_t') and t.length > 2:
+        return @.StrSlice(t.pchar, t.length - 2)
+    endif
+    return t
+endfunc
+
+func OCParser.TranslateType(raw_type : strslice, ptr_count : int, arr_dims : strslice) -> str:
+    var base : str = MapBaseTypeName(raw_type)
+    var pcnt : int = ptr_count
+
+    if base == 'void' and pcnt > 0:
+        base = 'pointer'
+        --pcnt
+    endif
+
+    var prefix : str = ''
+    if arr_dims.length > 0:
+        prefix += arr_dims
+    endif
+    for i : int = 0  count pcnt:
+        prefix += '^'
+    endfor
+
+    return prefix + base
+endfunc
+
+func OCParser.TryParseCast(sp : OCStrParse, rcast_dq : refout str) -> bool:
+    rcast_dq = ''
+    var saved : ^char = sp.readp
+    var inner_slice : strslice
+    if not sp.ReadBalanced('(', ')', inner_slice):
+        return false
+    endif
+
+    var itrim : strslice = TrimSlice(inner_slice)
+    if itrim.length == 0:
+        sp.readp = saved
+        return false
+    endif
+
+    var isp <- OCStrParse(itrim)
+    isp.SkipHSpaces()
+    var has_mod : bool = false
+    while (isp.CheckKeyword('const') or isp.CheckKeyword('volatile')
+           or isp.CheckKeyword('struct') or isp.CheckKeyword('union')
+           or isp.CheckKeyword('enum')):
+        has_mod = true
+        isp.SkipHSpaces()
+    endwhile
+
+    var twords : str = ''
+    if isp.CheckKeyword('unsigned') or isp.CheckKeyword('signed'):
+        twords = isp.PrevStr()
+        isp.SkipHSpaces()
+        if isp.CheckKeyword('int') or isp.CheckKeyword('char') or isp.CheckKeyword('short') or isp.CheckKeyword('long'):
+            twords += ' ' + isp.PrevStr()
+            isp.SkipHSpaces()
+        endif
+    else:
+        if not isp.ReadCIdent(twords):
+            sp.readp = saved
+            return false
+        endif
+        isp.SkipHSpaces()
+    endif
+
+    var ptrs : int = 0
+    while isp.readp < isp.bufend and isp.readp^ == '*':
+        ++ptrs
+        ++isp.readp
+        isp.SkipHSpaces()
+    endwhile
+
+    if isp.readp < isp.bufend:
+        sp.readp = saved
+        return false
+    endif
+
+    if not IsLikelyTypeName(twords, has_mod or ptrs > 0):
+        sp.readp = saved
+        return false
+    endif
+
+    var after_cast : ^char = sp.readp
+    sp.SkipHSpaces()
+    if sp.readp >= sp.bufend:
+        sp.readp = saved
+        return false
+    endif
+    var nc : char = sp.readp^
+    if not (sp.IsIdentStart(nc) or sp.IsDigit(nc) or nc == '(' or nc == '*' or nc == '&' or nc == '~' or nc == '!' or nc == '"' or nc == '\''):
+        sp.readp = saved
+        return false
+    endif
+    sp.readp = after_cast
+
+    rcast_dq = TranslateType(twords, ptrs, '')
+    return true
+endfunc
+
+func OCParser.ReadPostfixChain(sp : OCStrParse) -> str:
+    sp.SkipHSpaces()
+    if sp.readp >= sp.bufend:
+        return ''
+    endif
+
+    var out : str = ''
+    if sp.readp^ == '(':
+        var pinner : strslice
+        if sp.ReadBalanced('(', ')', pinner):
+            var pe : str = TranslateExpr(pinner)
+            out = '(' + pe + ')'
+        endif
+    elif sp.IsIdentStart(sp.readp^):
+        var id : str
+        sp.ReadCIdent(id)
+        out = id
+    endif
+
+    while sp.readp < sp.bufend:
+        if sp.CheckSym('->') or sp.CheckSym('::') or sp.CheckSym('.'):
+            out += '.'
+            var member : str
+            if sp.ReadCIdent(member):
+                out += member
+            endif
+        elif sp.readp^ == '[':
+            var idx_slice : strslice
+            if sp.ReadBalanced('[', ']', idx_slice):
+                var ie : str = TranslateExpr(TrimSlice(idx_slice))
+                out += '[' + ie + ']'
+            else:
+                break
+            endif
+        elif sp.readp^ == '(':
+            var call_slice : strslice
+            if sp.ReadBalanced('(', ')', call_slice):
+                var ce : str = TranslateExpr(TrimSlice(call_slice))
+                out += '(' + ce + ')'
+            else:
+                break
+            endif
+        else:
+            break
+        endif
+    endwhile
+
+    return out
+endfunc
+
+func OCParser.TranslateExpr(expr_slice : strslice) -> str:
+    result = ''
+    if expr_slice.length == 0:
+        return ''
+    endif
+
+    var sp <- OCStrParse(expr_slice)
+    var prev_was_operand : bool = false
+
+    while sp.readp < sp.bufend:
+        var c : char = sp.readp^
+
+        if c == ' ' or c == '\t' or c == '\r' or c == '\n':
+            var had_nl : bool = false
+            while sp.readp < sp.bufend and (sp.readp^ == ' ' or sp.readp^ == '\t' or sp.readp^ == '\r' or sp.readp^ == '\n'):
+                if sp.readp^ == '\n':
+                    had_nl = true
+                endif
+                ++sp.readp
+            endwhile
+            if had_nl:
+                result.Add('\n')
+            elif result.length > 0 and result[result.length - 1] <> ' ' and result[result.length - 1] <> '(' and result[result.length - 1] <> '[':
+                result.Add(' ')
+            endif
+            continue
+        endif
+
+        if c == '/' and sp.readp + 1 < sp.bufend and ((sp.readp + 1)^ == '/' or (sp.readp + 1)^ == '*'):
+            if (sp.readp + 1)^ == '/':
+                var cstart : ^char = sp.readp
+                sp.ReadTo('\r\n')
+                if result.length > 0 and result[result.length - 1] <> ' ':
+                    result.Add('  ')
+                endif
+                result.Add(@.StrSlice(cstart, sp.readp - cstart))
+            else:
+                var cstart : ^char = sp.readp
+                sp.readp += 2
+                if sp.SearchPattern('*/'):
+                    sp.readp += 2
+                else:
+                    sp.readp = sp.bufend
+                endif
+                result.Add(@.StrSlice(cstart, sp.readp - cstart))
+            endif
+            continue
+        endif
+
+        if c == '"' or c == '\'':
+            sp.SkipCLiteral()
+            result.Add(sp.PrevStr())
+            prev_was_operand = true
+            continue
+        endif
+
+        if sp.CheckSym('->') or sp.CheckSym('::'):
+            if result.length > 0 and result[result.length - 1] == ' ':
+                result.Delete(result.length - 1, 1)
+            endif
+            result.Add('.')
+            prev_was_operand = false
+            continue
+        endif
+
+        if sp.CheckSym('&&'):
+            if result.length > 0 and result[result.length - 1] <> ' ':
+                result.Add(' ')
+            endif
+            result.Add('and ')
+            prev_was_operand = false
+            continue
+        endif
+
+        if sp.CheckSym('||'):
+            if result.length > 0 and result[result.length - 1] <> ' ':
+                result.Add(' ')
+            endif
+            result.Add('or ')
+            prev_was_operand = false
+            continue
+        endif
+
+        if sp.CheckSym('!='):
+            if result.length > 0 and result[result.length - 1] <> ' ':
+                result.Add(' ')
+            endif
+            result.Add('<> ')
+            prev_was_operand = false
+            continue
+        endif
+
+        if sp.CheckSym('^='):
+            result.Add('=xor=')
+            prev_was_operand = false
+            continue
+        endif
+
+        if sp.CheckSym('==') or sp.CheckSym('<=') or sp.CheckSym('>=')
+           or sp.CheckSym('<<=') or sp.CheckSym('>>=')
+           or sp.CheckSym('<<') or sp.CheckSym('>>')
+           or sp.CheckSym('+=') or sp.CheckSym('-=')
+           or sp.CheckSym('*=') or sp.CheckSym('/=')
+           or sp.CheckSym('|=') or sp.CheckSym('&='):
+            result.Add(sp.PrevStr())
+            prev_was_operand = false
+            continue
+        endif
+
+        if sp.CheckSym('++') or sp.CheckSym('--'):
+            result.Add(sp.PrevStr())
+            continue
+        endif
+
+        if c == '!':
+            ++sp.readp
+            if result.length > 0 and result[result.length - 1] <> ' ' and result[result.length - 1] <> '(':
+                result.Add(' ')
+            endif
+            result.Add('not ')
+            prev_was_operand = false
+            continue
+        endif
+
+        if c == '^':
+            ++sp.readp
+            if result.length > 0 and result[result.length - 1] <> ' ':
+                result.Add(' ')
+            endif
+            result.Add('xor ')
+            prev_was_operand = false
+            continue
+        endif
+
+        if c == '%':
+            ++sp.readp
+            if result.length > 0 and result[result.length - 1] <> ' ':
+                result.Add(' ')
+            endif
+            result.Add('mod ')
+            prev_was_operand = false
+            continue
+        endif
+
+        if c == '*':
+            ++sp.readp
+            if not prev_was_operand:
+                var target : str = ReadPostfixChain(sp)
+                if target <> '':
+                    result.Add(target)
+                    result.Add('^')
+                    prev_was_operand = true
+                else:
+                    result.Add('*')
+                endif
+            else:
+                result.Add('*')
+                prev_was_operand = false
+            endif
+            continue
+        endif
+
+        if c == '&':
+            ++sp.readp
+            if not prev_was_operand:
+                var target : str = ReadPostfixChain(sp)
+                if target <> '':
+                    result.Add('%')
+                    result.Add(target)
+                    prev_was_operand = true
+                else:
+                    result.Add('%')
+                endif
+            else:
+                result.Add('&')
+                prev_was_operand = false
+            endif
+            continue
+        endif
+
+        if c == '(':
+            var cast_type : str
+            if not prev_was_operand and TryParseCast(sp, cast_type):
+                sp.SkipHSpaces()
+                var cast_arg : str = ''
+                if sp.readp < sp.bufend and sp.readp^ == '(':
+                    var pinner : strslice
+                    if sp.ReadBalanced('(', ')', pinner):
+                        cast_arg = TranslateExpr(TrimSlice(pinner))
+                    endif
+                elif sp.readp < sp.bufend and sp.readp^ == '&':
+                    ++sp.readp
+                    cast_arg = '%' + ReadPostfixChain(sp)
+                elif sp.readp < sp.bufend and sp.readp^ == '*':
+                    ++sp.readp
+                    cast_arg = ReadPostfixChain(sp) + '^'
+                else:
+                    cast_arg = ReadPostfixChain(sp)
+                endif
+                result.Add(cast_type)
+                result.Add('(')
+                result.Add(cast_arg)
+                result.Add(')')
+                prev_was_operand = true
+                continue
+            endif
+
+            var pslice : strslice
+            if sp.ReadBalanced('(', ')', pslice):
+                var sub_expr : str = TranslateExpr(pslice)
+                result.Add('(')
+                result.Add(sub_expr)
+                if pslice.Contains('//') and not sub_expr.EndsWith('\n'):
+                    result.Add('\n)')
+                else:
+                    result.Add(')')
+                endif
+                prev_was_operand = true
+                continue
+            endif
+        endif
+
+        if c == '[':
+            var bslice : strslice
+            if sp.ReadBalanced('[', ']', bslice):
+                var idx_expr : str = TranslateExpr(TrimSlice(bslice))
+                result.Add('[')
+                result.Add(idx_expr)
+                result.Add(']')
+                prev_was_operand = true
+                continue
+            endif
+        endif
+
+        if sp.IsDigit(c):
+            var num_start : ^char = sp.readp
+            if c == '0' and sp.readp + 1 < sp.bufend and ((sp.readp + 1)^ == 'x' or (sp.readp + 1)^ == 'X'):
+                sp.readp += 2
+                sp.ReadHexNumbers()
+                result.Add('0x')
+                result.Add(sp.PrevStr())
+            else:
+                while sp.readp < sp.bufend and (sp.IsDigit(sp.readp^) or sp.readp^ == '.'):
+                    ++sp.readp
+                endwhile
+                result.Add(@.StrSlice(num_start, sp.readp - num_start))
+            endif
+            while sp.readp < sp.bufend and (sp.readp^ == 'u' or sp.readp^ == 'U' or sp.readp^ == 'l' or sp.readp^ == 'L' or sp.readp^ == 'f' or sp.readp^ == 'F'):
+                ++sp.readp
+            endwhile
+            prev_was_operand = true
+            continue
+        endif
+
+        if sp.IsIdentStart(c):
+            var ident : str
+            sp.ReadCIdent(ident)
+            if ident == 'nullptr' or ident == 'NULL':
+                result.Add('nil')
+                prev_was_operand = true
+            elif ident == 'this':
+                result.Add('self')
+                prev_was_operand = true
+            elif ident == 'sizeof':
+                sp.SkipHSpaces()
+                if sp.readp < sp.bufend and sp.readp^ == '(':
+                    var sz_inner : strslice
+                    if sp.ReadBalanced('(', ')', sz_inner):
+                        var sz_sp <- OCStrParse(TrimSlice(sz_inner))
+                        if sz_sp.CheckKeyword('struct') or sz_sp.CheckKeyword('union') or sz_sp.CheckKeyword('enum'):
+                            sz_sp.SkipHSpaces()
+                        endif
+                        var sz_rest : strslice = TrimSlice(@.StrSlice(sz_sp.readp, sz_sp.bufend - sz_sp.readp))
+                        var sz_type : str = MapBaseTypeName(sz_rest)
+                        result.Add('SizeOf(')
+                        result.Add(sz_type)
+                        result.Add(')')
+                        prev_was_operand = true
+                        continue
+                    endif
+                endif
+                result.Add('SizeOf')
+                prev_was_operand = false
+            else:
+                result.Add(ident)
+                prev_was_operand = true
+            endif
+            continue
+        endif
+
+        result.Add(c)
+        ++sp.readp
+        prev_was_operand = (c == ')' or c == ']')
+    endwhile
+
+    var rtrim : strslice = TrimSlice(result)
+    var rclean : str = rtrim
+    result = rclean
+endfunc
