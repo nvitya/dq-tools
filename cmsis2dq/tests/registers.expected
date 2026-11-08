@@ -4,7 +4,7 @@ const(uint32):
     MULTILINE            = (FLAG  |                    SHIFT)
     OPERATORS            = (FLAG  and  SHIFT  or  FLAG  <>  SHIFT)
     BITS                 = ( ~ FLAG  &  SHIFT  xor  FLAG)
-    MATH                 = (SHIFT  div  2  mod  3)
+    MATH                 = (SHIFT  div  2  rem  3)
     COMPARE              = (FLAG  ==  SHIFT  |  FLAG  <=  SHIFT  |  FLAG  >=  SHIFT  |  SHIFT  >>  1)
     LATER                = 3
     INTEGER              = 9

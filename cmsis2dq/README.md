@@ -1,8 +1,8 @@
 # cmsis2dq
 
-Native DQ port of `dq-lang/tools/cmsis2dq.py`, using the standard `regexp`
-package. The parser converts CMSIS register structures, unions, explicit enum
-values, numeric macros and peripheral pointers to DQ declarations.
+The parser converts CMSIS register
+structures, unions, explicit enum values, numeric macros and peripheral pointers
+to DQ declarations.
 
 ```sh
 make
@@ -31,14 +31,6 @@ Review the generated declarations before using them. The CLI also supports
 `--help`, `-o`, and nonzero exit status for errors.
 
 ## DQ API observations
-
-No missing language feature blocks this port. Two library conveniences would
-simplify it:
-
-- Literal string replacement: currently expressed with `StrSplit` / `StrJoin`
-  in `OCExpression.ReplaceText`, including type-name and suffix normalization.
-- Regexp replacement callbacks: operator mapping currently iterates
-  `StartSearch` / `SearchNext` and copies the intervening slices.
 
 Known constant names use the existing dynamic string array's `IndexOf`.
 Its linear lookup is sufficient for the tested headers; a standard string set

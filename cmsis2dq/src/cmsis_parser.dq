@@ -124,7 +124,7 @@ func OCmsisParser.AddConst(ctype : str, name : str, value : str, comment : strsl
 endfunc
 
 func OCmsisParser.FormatField(modifier : str, ctype : str, name : str, arr : str, comment : strslice) -> str:
-    ctype = expr.ReplaceText(ctype, '_t', '')
+    ctype = @sys.StrReplace(ctype, '_t', '')
     if ctype.Contains('RSSLIB_'):
         ctype = 'uint32'
     endif
@@ -178,7 +178,7 @@ func OCmsisParser.EndCompound(name : str, arr : str):
     try:
         if contexts.length == 0:
             if name == '':
-                name = expr.ReplaceText(ctx.name, '_t', '')
+                name = @sys.StrReplace(ctx.name, '_t', '')
             endif
             EmitCompound(ctx, name)
             return
@@ -232,14 +232,14 @@ func OCmsisParser.ParseDefine(line : strslice):
         if expr.known_consts.IndexOf(name) < 0:
             FlushConsts()
             output.Add('const ' + name.RPad(12, ' ') + ' :? = ^'
-                + expr.ReplaceText(re_ptr_cast[1], '_t', '') + '(' + re_ptr_cast[2] + ')\n')
+                + @sys.StrReplace(re_ptr_cast[1], '_t', '') + '(' + re_ptr_cast[2] + ')\n')
             expr.known_consts.Append(name)
         endif
         return
     endif
 
     value = expr.Macro(value)
-    if expr.ReplaceText(value, ' ', '').Contains('*)') or value.Contains('!')
+    if @sys.StrReplace(value, ' ', '').Contains('*)') or value.Contains('!')
         or value.Contains('{') or value.Contains('}') or value.Contains(','):
         return
     endif
@@ -268,7 +268,7 @@ func OCmsisParser.ParseLine(line : strslice):
         if re_nested.Search(line):
             contexts.Append(new OCompound(re_nested[1], ''))
         elif re_end.Search(line):
-            EndCompound(expr.ReplaceText(re_end[1], '_t', ''), re_end[2])
+            EndCompound(@sys.StrReplace(re_end[1], '_t', ''), re_end[2])
         elif re_field.Search(line):
             contexts[contexts.length - 1].fields.Append('    '
                 + FormatField(re_field[1], re_field[2], re_field[3], re_field[4], re_field[5]))
@@ -292,8 +292,8 @@ endfunc
 func OCmsisParser.Translate(source : strslice, ano_comments : bool) -> str:
     Reset()
     no_comments = ano_comments
-    var normalized : str = expr.ReplaceText(source, '\r\n', '\n')
-    normalized = expr.ReplaceText(normalized, '\r', '\n')
+    var normalized : str = @sys.StrReplace(source, '\r\n', '\n')
+    normalized = @sys.StrReplace(normalized, '\r', '\n')
     var lines : [*]str = @sys.StrSplit(normalized, '\n')
     // StrSplit retains a trailing empty part; readlines() has no such extra line.
     if normalized.EndsWith('\n'):

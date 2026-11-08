@@ -12,11 +12,12 @@ private
     re_word     <- ORegExp()
     re_comment  <- ORegExp()
 
+    func ConvertOperator(amatch : ORegExp) -> str ..
+
 public
     known_consts : [*]str
 
     func *Create() ..
-    func ReplaceText(value : strslice, old_text : strslice, new_text : strslice) -> str ..
     func Numbers(value : strslice) -> str ..
     func Operators(value : strslice) -> str ..
     func Macro(value : strslice) -> str ..
@@ -40,49 +41,43 @@ func OCExpression.*Create():
 endfunc
 
 func OCExpression.Numbers(value : strslice) -> str:
-    return ReplaceText(re_suffix.Replace(value, '$1'), '0X', '0x')
+    return @sys.StrReplace(re_suffix.Replace(value, '$1'), '0X', '0x')
 endfunc
 
 func OCExpression.Operators(value : strslice) -> str:
-    // Replacement templates cannot compute a value from each captured operator.
-    // Iterate matches, retaining the untouched slices between them.
-    result = ''
-    var pos : int = 0
-    re_operator.StartSearch(value)
-    while re_operator.SearchNext():
-        result.Add(value[pos:re_operator.match_start])
-        var op : str = re_operator.match
-        if op == '&&':
-            op = 'and'
-        elif op == '||':
-            op = 'or'
-        elif op == '!=':
-            op = '<>'
-        elif op == "^":
-            op = 'xor'
-        elif op == "/":
-            op = 'div'
-        elif op == "%":
-            op = 'mod'
-        endif
-        result.Add(' ' + op + ' ')
-        pos = re_operator.match_end
-    endwhile
-    result.Add(value[pos:])
+    return re_operator.Replace(value, self.ConvertOperator)
+endfunc
+
+func OCExpression.ConvertOperator(amatch : ORegExp) -> str:
+    var op : str = amatch.match
+    if op == '&&':
+        op = 'and'
+    elif op == '||':
+        op = 'or'
+    elif op == '!=':
+        op = '<>'
+    elif op == "^":
+        op = 'xor'
+    elif op == "/":
+        op = 'div'
+    elif op == "%":
+        op = 'rem'
+    endif
+    return ' ' + op + ' '
 endfunc
 
 func OCExpression.Macro(value : strslice) -> str:
     var val : str = re_cast.Replace(value, '')
     val = re_parens.Replace(val, '$1')
-    return ReplaceText(Operators(val), '0x0x', '0x')
+    return @sys.StrReplace(Operators(val), '0x0x', '0x')
 endfunc
 
 func OCExpression.EnumValue(value : strslice) -> str:
     var val : str = Operators(Numbers(StripComment(value)))
-    val = ReplaceText(val, '!RESET', '1')
-    val = ReplaceText(val, '!DISABLE', '1')
-    val = ReplaceText(val, '!SUCCESS', '1')
-    return ReplaceText(val, '0x0x', '0x')
+    val = @sys.StrReplace(val, '!RESET', '1')
+    val = @sys.StrReplace(val, '!DISABLE', '1')
+    val = @sys.StrReplace(val, '!SUCCESS', '1')
+    return @sys.StrReplace(val, '0x0x', '0x')
 endfunc
 
 func OCExpression.Valid(value : strslice) -> bool:
@@ -118,8 +113,4 @@ func OCExpression.Comment(value : strslice, text : refout str) -> bool:
         return true
     endif
     return false
-endfunc
-
-func OCExpression.ReplaceText(value : strslice, old_text : strslice, new_text : strslice) -> str:
-    return @sys.StrJoin(@sys.StrSplit(value, old_text), new_text)
 endfunc
