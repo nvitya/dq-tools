@@ -1,0 +1,91 @@
+const(uint32):
+    FLAG                 = 1
+    SHIFT                = ( (FLAG  <<  4))
+    MULTILINE            = (FLAG  |                    SHIFT)
+    OPERATORS            = (FLAG  and  SHIFT  or  FLAG  <>  SHIFT)
+    BITS                 = ( ~ FLAG  &  SHIFT  xor  FLAG)
+    MATH                 = (SHIFT  div  2  mod  3)
+    COMPARE              = (FLAG  ==  SHIFT  |  FLAG  <=  SHIFT  |  FLAG  >=  SHIFT  |  SHIFT  >>  1)
+    LATER                = 3
+    INTEGER              = 9
+    HEX                  = 0x12
+    UPPERCASE_HEX        = 0x12
+    DUPLICATE_HEX        = 0x12
+endconst
+
+const(int):
+    IRQ_Reset            = -1
+    IRQ_Timer            = 2
+    IRQ_Alias            = IRQ_Timer
+    IRQ_Logic            = (FLAG  and  IRQ_Timer)
+    IRQ_NotReset         = 1
+    IRQ_NotDisable       = 1
+    IRQ_NotSuccess       = 1
+endconst
+
+struct NestedStruct_2:
+        FIRST        :            uint32  
+        union u_INNER:
+            INNER        :            uint32  
+            SMALL        :            [2] uint16
+        endunion
+endstruct
+
+struct NestedStruct_3:
+        SIGNED       :            int32   
+endstruct
+
+struct Device:
+    CTRL         : [[regrw]]  uint32  
+    STATUS       : [[regro]]  uint32  
+    DATA         : [[regwo]]  [2] uint16
+    IOM          : [[regrw]]  uint32  
+    IM           : [[regro]]  uint32  
+    OM           : [[regwo]]  uint32  
+    RO           : [[regro]]  uint8   
+    RW           : [[regrw]]  uint64  
+    RESERVED     :            [(SHIFT  div  2)] uint32
+    EMPTY        :            uint8   
+    ATSAM        :            uint32  
+    BYTE         :            uint8   
+    HALFWORD     :            uint16  
+    WIDE         :            uint64  
+    REG          :            uint32  
+    SPECIAL      :            uint32  
+    GROUP        :            [2] NestedStruct_2
+    s_anon_4     :            NestedStruct_3
+    union u_WORD:
+        WORD         :            uint32  
+        BYTES        :            [4] uint8
+    endunion
+    union NAMED:
+        NAMED_WORD   :            uint32  
+        NAMED_HALVES :            [2] uint16
+    endunion
+    union u_anon_6:
+    endunion
+endstruct
+
+struct Named:
+    VALUE        :            uint32  
+endstruct
+
+union Word:
+    WORD         :            uint32  
+    BYTES        :            [4] uint8
+endunion
+
+union NamedUnion:
+    SIGNED       :            int32   
+    UNSIGNED     :            uint32  
+endunion
+
+const(uint32):
+    DEVICE_BASE          = 0x40000000
+endconst
+
+const DEVICE       :? = ^Device(DEVICE_BASE)
+const(uint32):
+    DEVICE_ALIAS         = DEVICE
+endconst
+

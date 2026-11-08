@@ -1,0 +1,125 @@
+// Expression and comment conversion shared by macros, enum items and fields.
+use regexp
+
+object OCExpression:
+private
+    re_suffix   <- ORegExp()
+    re_operator <- ORegExp()
+    re_cast     <- ORegExp()
+    re_parens   <- ORegExp()
+    re_hex      <- ORegExp()
+    re_decimal  <- ORegExp()
+    re_word     <- ORegExp()
+    re_comment  <- ORegExp()
+
+public
+    known_consts : [*]str
+
+    func *Create() ..
+    func ReplaceText(value : strslice, old_text : strslice, new_text : strslice) -> str ..
+    func Numbers(value : strslice) -> str ..
+    func Operators(value : strslice) -> str ..
+    func Macro(value : strslice) -> str ..
+    func EnumValue(value : strslice) -> str ..
+    func Valid(value : strslice) -> bool ..
+    func StripComment(value : strslice) -> str ..
+    func Comment(value : strslice, text : refout str) -> bool ..
+endobject
+
+implementation
+
+func OCExpression.*Create():
+    re_suffix.Prepare('\\b(0x[0-9a-fA-F]+|[0-9]+)[UuLl]+\\b')
+    re_operator.Prepare('&&|\\|\\||!=|==|<=|>=|<<|>>|[~&|^/%]')
+    re_cast.Prepare('\\(\\s*u?int\\d+_t\\s*\\)')
+    re_parens.Prepare('^\\s*\\(\\s*([^() ]+)\\s*\\)\\s*$')
+    re_hex.Prepare('0x[0-9a-fA-F]+')
+    re_decimal.Prepare('\\b[0-9]+\\b')
+    re_word.Prepare('[A-Za-z_][A-Za-z0-9_]*')
+    re_comment.Prepare('/\\*!*<*\\s*(.*?)\\s*\\*/')
+endfunc
+
+func OCExpression.Numbers(value : strslice) -> str:
+    return ReplaceText(re_suffix.Replace(value, '$1'), '0X', '0x')
+endfunc
+
+func OCExpression.Operators(value : strslice) -> str:
+    // Replacement templates cannot compute a value from each captured operator.
+    // Iterate matches, retaining the untouched slices between them.
+    result = ''
+    var pos : int = 0
+    re_operator.StartSearch(value)
+    while re_operator.SearchNext():
+        result.Add(value[pos:re_operator.match_start])
+        var op : str = re_operator.match
+        if op == '&&':
+            op = 'and'
+        elif op == '||':
+            op = 'or'
+        elif op == '!=':
+            op = '<>'
+        elif op == "^":
+            op = 'xor'
+        elif op == "/":
+            op = 'div'
+        elif op == "%":
+            op = 'mod'
+        endif
+        result.Add(' ' + op + ' ')
+        pos = re_operator.match_end
+    endwhile
+    result.Add(value[pos:])
+endfunc
+
+func OCExpression.Macro(value : strslice) -> str:
+    var val : str = re_cast.Replace(value, '')
+    val = re_parens.Replace(val, '$1')
+    return ReplaceText(Operators(val), '0x0x', '0x')
+endfunc
+
+func OCExpression.EnumValue(value : strslice) -> str:
+    var val : str = Operators(Numbers(StripComment(value)))
+    val = ReplaceText(val, '!RESET', '1')
+    val = ReplaceText(val, '!DISABLE', '1')
+    val = ReplaceText(val, '!SUCCESS', '1')
+    return ReplaceText(val, '0x0x', '0x')
+endfunc
+
+func OCExpression.Valid(value : strslice) -> bool:
+    var temp : str = re_decimal.Replace(re_hex.Replace(value, ''), '')
+    var operator_words : [7]str = ['and', 'or', 'not', 'xor', 'div', 'rem', 'mod']
+    re_word.StartSearch(temp)
+    while re_word.SearchNext():
+        var word : str = re_word.match
+        if known_consts.IndexOf(word) < 0 and operator_words.IndexOf(word) < 0:
+            return false
+        endif
+    endwhile
+    return true
+endfunc
+
+func OCExpression.StripComment(value : strslice) -> str:
+    var stop : int = value.length
+    var pos : int = value.IndexOf('/*')
+    if pos >= 0:
+        stop = pos
+    endif
+    pos = value.IndexOf('//')
+    if pos >= 0 and pos < stop:
+        stop = pos
+    endif
+    return value[:stop].Trim()
+endfunc
+
+func OCExpression.Comment(value : strslice, text : refout str) -> bool:
+    text = ''
+    if re_comment.Search(value):
+        text = re_comment[1]
+        return true
+    endif
+    return false
+endfunc
+
+func OCExpression.ReplaceText(value : strslice, old_text : strslice, new_text : strslice) -> str:
+    return @sys.StrJoin(@sys.StrSplit(value, old_text), new_text)
+endfunc

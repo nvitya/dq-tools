@@ -1,0 +1,4 @@
+/cmsis2dq
+/.dqbuild/
+/tests/.dqbuild/
+/tests/test_cmsis2dq

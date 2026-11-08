@@ -1,0 +1,315 @@
+// Line-oriented port of dq-lang/tools/cmsis2dq.py.
+use regexp
+use ./c_expr
+
+object OCompound:
+    kind   : str
+    name   : str
+    fields : [*]str
+
+    func *Create(akind : str, aname : strslice):
+        kind = akind
+        name = aname
+    endfunc
+endobject
+
+object OCmsisParser:
+private
+    expr           <- OCExpression()
+    re_define      <- ORegExp()
+    re_ptr_cast    <- ORegExp()
+    re_typedef     <- ORegExp()
+    re_compound    <- ORegExp()
+    re_enum        <- ORegExp()
+    re_nested      <- ORegExp()
+    re_end         <- ORegExp()
+    re_field       <- ORegExp()
+    re_enum_end    <- ORegExp()
+    re_enum_item   <- ORegExp()
+    re_first_field <- ORegExp()
+
+    output         : str
+    pending_type   : str
+    pending_consts : [*]str
+    contexts       : [*]OCompound
+    in_enum        : bool = false
+    no_comments    : bool = false
+    anon_counter   : int = 1
+
+    func Reset() ..
+    func FlushConsts() ..
+    func AddConst(ctype : str, name : str, value : str, comment : strslice = '') ..
+    func FormatField(modifier : str, ctype : str, name : str, arr : str, comment : strslice = '') -> str ..
+    func EmitCompound(ctx : OCompound, name : str, indent : strslice = '') ..
+    func EndCompound(name : str, arr : str) ..
+    func ParseDefine(line : strslice) ..
+    func ParseEnum(line : strslice) ..
+    func ParseLine(line : strslice) ..
+
+public
+    func *Create() ..
+    func *Destroy() ..
+    func Translate(source : strslice, ano_comments : bool = false) -> str ..
+endobject
+
+implementation
+
+const MAX_CONST_BLOCK_LENGTH : int = 32
+const CONST_NAME_PADDING : int = 20
+const STRUCT_FIELD_PADDING : int = 12
+const STRUCT_TYPE_PADDING : int = 8
+const ARRAY_TYPE_SPACING : int = 1
+const ATTR_TYPE_SPACING : int = 2
+
+func OCmsisParser.*Create():
+    re_define.Prepare('^\\s*#define\\s+([A-Za-z0-9_]+)(?:\\s+(.*))?')
+    re_ptr_cast.Prepare('^\\s*\\(?\\s*\\(\\s*([A-Za-z0-9_]+)\\s*\\*\\s*\\)\\s*(.+?)\\)?\\s*$')
+    re_typedef.Prepare('^\\s*typedef\\s+(struct|union)\\s*\\{?')
+    re_compound.Prepare('^\\s*(struct|union)\\s+([A-Za-z0-9_]+)\\s*\\{?')
+    re_enum.Prepare('^\\s*typedef\\s+enum\\s*\\{?')
+    re_nested.Prepare('^\\s*(struct|union)\\s*\\{')
+    re_end.Prepare('^\\s*\\}\\s*([A-Za-z0-9_]*)(?:(\\[[^\\]]+\\]))?\\s*;')
+    re_field.Prepare('^\\s*(__IOM?|__OM?|__IM?|volatile\\s+const|volatile)?\\s*'
+        + '(uint[0-9]+_t|int[0-9]+_t|[A-Za-z0-9_]+)\\s+([A-Za-z0-9_]+)(\\[[^\\]]+\\])?\\s*;(.*)')
+    re_enum_end.Prepare('^\\s*\\}\\s*([A-Za-z0-9_]*)\\s*;')
+    re_enum_item.Prepare('^\\s*([A-Za-z0-9_]+)\\s*=\\s*([^,/]+)(?:,)?(.*)')
+    re_first_field.Prepare('^\\s*([A-Za-z0-9_]+)\\s*:')
+endfunc
+
+func OCmsisParser.*Destroy():
+    Reset()
+endfunc
+
+func OCmsisParser.Reset():
+    while contexts.length > 0:
+        delete contexts.Pop()
+    endwhile
+    output.Clear()
+    pending_type.Clear()
+    pending_consts.Clear()
+    expr.known_consts.Clear()
+    in_enum = false
+    anon_counter = 1
+endfunc
+
+func OCmsisParser.FlushConsts():
+    if pending_consts.length > 0:
+        output.AddFmt('const({}):\n', [pending_type])
+        for i : int = 0 count pending_consts.length:
+            output.Add(pending_consts[i] + '\n')
+        endfor
+        output.Add('endconst\n\n')
+    endif
+    pending_type.Clear()
+    pending_consts.Clear()
+endfunc
+
+func OCmsisParser.AddConst(ctype : str, name : str, value : str, comment : strslice):
+    if expr.known_consts.IndexOf(name) >= 0:
+        return
+    endif
+    if pending_type <> ctype and pending_consts.length > 0:
+        FlushConsts()
+    endif
+    pending_type = ctype
+    var line : str = '    ' + name.RPad(@.CONST_NAME_PADDING, ' ') + ' = ' + value
+    if comment <> '' and not no_comments:
+        line.Add('  // ' + comment)
+    endif
+    pending_consts.Append(line)
+    expr.known_consts.Append(name)
+    if pending_consts.length >= @.MAX_CONST_BLOCK_LENGTH:
+        FlushConsts()
+    endif
+endfunc
+
+func OCmsisParser.FormatField(modifier : str, ctype : str, name : str, arr : str, comment : strslice) -> str:
+    ctype = expr.ReplaceText(ctype, '_t', '')
+    if ctype.Contains('RSSLIB_'):
+        ctype = 'uint32'
+    endif
+    var base_type : str = ctype.Trim()
+    if base_type.EndsWith('Reg8'):
+        ctype = 'uint8'
+    elif base_type.EndsWith('Reg16'):
+        ctype = 'uint16'
+    elif base_type.EndsWith('Reg32'):
+        ctype = 'uint32'
+    elif base_type.EndsWith('Reg64'):
+        ctype = 'uint64'
+    elif base_type == 'RoReg' or base_type == 'RwReg' or base_type == 'WoReg' or base_type == 'Reg':
+        ctype = 'uint32'
+    endif
+
+    var attr : str
+    if modifier == '__IOM' or modifier == '__IO' or modifier == 'volatile':
+        attr = '[[regrw]]'
+    elif modifier == '__IM' or modifier == '__I' or modifier == 'volatile const':
+        attr = '[[regro]]'
+    elif modifier == '__OM' or modifier == '__O':
+        attr = '[[regwo]]'
+    endif
+    if arr <> '':
+        var spacer : str = ''
+        ctype = '[' + expr.Operators(expr.Numbers(arr.Trim('[]'))) + ']'
+            + spacer.RPad(@.ARRAY_TYPE_SPACING, ' ') + ctype
+    endif
+    result = name.RPad(@.STRUCT_FIELD_PADDING, ' ') + ' : '
+        + attr.RPad(9 + @.ATTR_TYPE_SPACING, ' ') + ctype.RPad(@.STRUCT_TYPE_PADDING, ' ')
+    if not no_comments:
+        var cm : str
+        if expr.Comment(comment, cm):
+            result.Add('  // ' + cm)
+        endif
+    endif
+endfunc
+
+func OCmsisParser.EmitCompound(ctx : OCompound, name : str, indent : strslice):
+    FlushConsts()
+    output.Add(ctx.kind + ' ' + name + ':\n')
+    for i : int = 0 count ctx.fields.length:
+        output.Add(indent + ctx.fields[i] + '\n')
+    endfor
+    output.Add('end' + ctx.kind + '\n\n')
+endfunc
+
+func OCmsisParser.EndCompound(name : str, arr : str):
+    var ctx : OCompound = contexts.Pop()
+    try:
+        if contexts.length == 0:
+            if name == '':
+                name = expr.ReplaceText(ctx.name, '_t', '')
+            endif
+            EmitCompound(ctx, name)
+            return
+        endif
+
+        var parent : OCompound = contexts[contexts.length - 1]
+        if ctx.kind == 'struct':
+            // The enclosing typedef name is not known yet; use a unique name.
+            var nested_name : str
+            nested_name.AddFmt('NestedStruct_{}', [anon_counter])
+            ++anon_counter
+            EmitCompound(ctx, nested_name, '    ')
+            if name == '':
+                name.AddFmt('s_anon_{}', [anon_counter])
+                ++anon_counter
+            endif
+            parent.fields.Append('    ' + FormatField('', nested_name, name, arr))
+        else:
+            if name == '':
+                if ctx.fields.length > 0 and re_first_field.Search(ctx.fields[0]):
+                    name = 'u_' + re_first_field[1]
+                else:
+                    name.AddFmt('u_anon_{}', [anon_counter])
+                endif
+                ++anon_counter
+            endif
+            parent.fields.Append('    union ' + name + ':')
+            for i : int = 0 count ctx.fields.length:
+                parent.fields.Append('    ' + ctx.fields[i])
+            endfor
+            parent.fields.Append('    endunion')
+        endif
+    finally:
+        delete ctx
+    endtry
+endfunc
+
+func OCmsisParser.ParseDefine(line : strslice):
+    var name : str = re_define[1]
+    // A parenthesis immediately after the name denotes a function-like macro.
+    var name_end : int = re_define.GroupEnd(1)
+    if name_end < line.length and line[name_end] == '(':
+        return
+    endif
+    var value : str = expr.StripComment(re_define[2])
+    if value == '':
+        return
+    endif
+    value = expr.Numbers(value)
+    if re_ptr_cast.Search(value):
+        if expr.known_consts.IndexOf(name) < 0:
+            FlushConsts()
+            output.Add('const ' + name.RPad(12, ' ') + ' :? = ^'
+                + expr.ReplaceText(re_ptr_cast[1], '_t', '') + '(' + re_ptr_cast[2] + ')\n')
+            expr.known_consts.Append(name)
+        endif
+        return
+    endif
+
+    value = expr.Macro(value)
+    if expr.ReplaceText(value, ' ', '').Contains('*)') or value.Contains('!')
+        or value.Contains('{') or value.Contains('}') or value.Contains(','):
+        return
+    endif
+    if expr.Valid(value):
+        AddConst('uint32', name, value)
+    endif
+endfunc
+
+func OCmsisParser.ParseEnum(line : strslice):
+    if re_enum_end.Search(line):
+        in_enum = false
+    elif re_enum_item.Search(line):
+        var value : str = expr.EnumValue(re_enum_item[2])
+        if not value.Contains('!') and expr.Valid(value):
+            var comment : str
+            expr.Comment(re_enum_item[3], comment)
+            AddConst('int', re_enum_item[1], value, comment)
+        endif
+    endif
+endfunc
+
+func OCmsisParser.ParseLine(line : strslice):
+    if in_enum:
+        ParseEnum(line)
+    elif contexts.length > 0:
+        if re_nested.Search(line):
+            contexts.Append(new OCompound(re_nested[1], ''))
+        elif re_end.Search(line):
+            EndCompound(expr.ReplaceText(re_end[1], '_t', ''), re_end[2])
+        elif re_field.Search(line):
+            contexts[contexts.length - 1].fields.Append('    '
+                + FormatField(re_field[1], re_field[2], re_field[3], re_field[4], re_field[5]))
+        elif not no_comments and not line.Contains('{') and not line.Contains('}') and line.Trim() <> '':
+            contexts[contexts.length - 1].fields.Append('    // unparsed: ' + line.Trim())
+        endif
+    elif re_define.Search(line):
+        ParseDefine(line)
+    elif re_typedef.Search(line):
+        FlushConsts()
+        contexts.Append(new OCompound(re_typedef[1], ''))
+    elif re_compound.Search(line):
+        FlushConsts()
+        contexts.Append(new OCompound(re_compound[1], re_compound[2]))
+    elif re_enum.Search(line):
+        FlushConsts()
+        in_enum = true
+    endif
+endfunc
+
+func OCmsisParser.Translate(source : strslice, ano_comments : bool) -> str:
+    Reset()
+    no_comments = ano_comments
+    var normalized : str = expr.ReplaceText(source, '\r\n', '\n')
+    normalized = expr.ReplaceText(normalized, '\r', '\n')
+    var lines : [*]str = @sys.StrSplit(normalized, '\n')
+    // StrSplit retains a trailing empty part; readlines() has no such extra line.
+    if normalized.EndsWith('\n'):
+        lines.Pop()
+    endif
+    var current_line : str
+    for i : int = 0 count lines.length:
+        var line : str = lines[i].RTrim()
+        if line.EndsWith('\\'):
+            current_line.Add(line[:line.length - 1])
+        else:
+            current_line.Add(line)
+            ParseLine(current_line)
+            current_line.Clear()
+        endif
+    endfor
+    FlushConsts()
+    return output
+endfunc

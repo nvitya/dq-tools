@@ -1,0 +1,45 @@
+#opt module_root_depth = 1
+
+use print
+use file
+use ../src/cmsis_parser
+
+func Check(label : strslice, actual : strslice, expected : strslice):
+    if actual <> expected:
+        raise Exception('FAIL: {}\nExpected:\n{}\nActual:\n{}', [label, expected, actual])
+    endif
+    PrintLn('PASS: {}', [label])
+endfunc
+
+func *Main():
+    var parser <- OCmsisParser()
+    var source : str = FileReadText('tests/registers.h')
+    Check('CMSIS constructs with comments', parser.Translate(source), FileReadText('tests/registers.expected'))
+    Check('CMSIS constructs without comments', parser.Translate(source, true), FileReadText('tests/registers_no_comments.expected'))
+    Check('parser reuse resets names and state', parser.Translate(source), FileReadText('tests/registers.expected'))
+
+    var input : str
+    var expected : str
+    for i : int = 0 count 65:
+        if i mod 32 == 0:
+            expected.Add('const(uint32):\n')
+        endif
+        var name : str = Format('CONST_{}', [i])
+        input.AddFmt('#define {} {}U\n', [name, i])
+        expected.AddFmt('    {} = {}\n', [name.RPad(20, ' '), i])
+        if i mod 32 == 31 or i == 64:
+            expected.Add('endconst\n\n')
+        endif
+    endfor
+    Check('32 item constant blocks', parser.Translate(input), expected)
+
+    Check('empty input', parser.Translate(''), '')
+    var single : str = 'const(uint32):\n    VALUE                = 1\nendconst\n\n'
+    Check('no final newline', parser.Translate('#define VALUE 1U'), single)
+    Check('CRLF continuation', parser.Translate('#define VALUE \\\r\n1U\r\n'), single)
+    Check('CR line endings', parser.Translate('#define VALUE 1U\r'), single)
+    Check('unfinished continuation', parser.Translate('#define VALUE 1U\\\n'), '')
+    Check('unfinished continuation without newline', parser.Translate('#define VALUE 1U\\'), '')
+    Check('unfinished compound', parser.Translate('typedef struct {\nuint32_t VALUE;\n'), '')
+    Check('reuse after unfinished compound', parser.Translate('#define VALUE 1U'), single)
+endfunc

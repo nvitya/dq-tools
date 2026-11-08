@@ -1,0 +1,57 @@
+use print
+use file
+use ./cmsis_parser
+
+func PrintUsage():
+    PrintLn('Usage: cmsis2dq [--no-comments] <input.h> [-o <output.dq>]')
+endfunc
+
+func *Main():
+    var input_file : str
+    var output_file : str
+    var no_comments : bool = false
+    var i : int = 1
+    while i < ArgCount():
+        var arg : str = ArgStr(i)
+        if arg == '--no-comments':
+            no_comments = true
+        elif arg == '-h' or arg == '--help':
+            PrintUsage()
+            return
+        elif arg == '-o':
+            ++i
+            if i >= ArgCount():
+                PrintLn('Error: missing filename after -o')
+                exit_code = 1
+                return
+            endif
+            output_file = ArgStr(i)
+        elif input_file == '' and not arg.StartsWith('-'):
+            input_file = arg
+        else:
+            PrintLn('Error: unexpected argument: {}', [arg])
+            exit_code = 1
+            return
+        endif
+        ++i
+    endwhile
+    if input_file == '':
+        PrintUsage()
+        exit_code = 1
+        return
+    endif
+
+    try:
+        var source : str = FileReadText(input_file)
+        var parser <- OCmsisParser()
+        var translated : str = parser.Translate(source, no_comments)
+        if output_file <> '':
+            FileWriteText(output_file, translated)
+        else:
+            Print('{}', [translated])
+        endif
+    except Exception as e:
+        PrintLn('Error: {}', [e.message])
+        exit_code = 1
+    endtry
+endfunc

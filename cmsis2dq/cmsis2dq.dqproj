@@ -1,0 +1,2 @@
+main = 'src/main_cmsis2dq.dq'
+output = 'cmsis2dq'
