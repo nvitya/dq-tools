@@ -276,21 +276,22 @@ func OCParser.ParseClassOrStruct(sp : OCStrParse, parent : OCodeNode, akind : NC
         endif
     endif
 
-    sp.SkipSpaces()
+    var head_comm : str = ''
+    sp.SkipSpacesAndComments(head_comm)
     var tag_name : str = ''
     if sp.ReadCIdent(tag_name):
-        sp.SkipSpaces()
+        sp.SkipSpacesAndComments(head_comm)
     endif
 
     var base_name : str = ''
     if sp.readp < sp.bufend and sp.readp^ == ':':
         ++sp.readp
-        sp.SkipSpaces()
+        sp.SkipSpacesAndComments(head_comm)
         if sp.CheckKeyword('public') or sp.CheckKeyword('protected') or sp.CheckKeyword('private'):
-            sp.SkipSpaces()
+            sp.SkipSpacesAndComments(head_comm)
         endif
         sp.ReadCIdent(base_name)
-        sp.SkipSpaces()
+        sp.SkipSpacesAndComments(head_comm)
     endif
 
     // Must be followed by '{' to be a class/struct definition (not `struct CRU_REG * ptr`)
@@ -329,7 +330,8 @@ func OCParser.ParseClassOrStruct(sp : OCStrParse, parent : OCodeNode, akind : NC
     var cnode : OCodeNode = parent.AddChild(akind)
     cnode.name = final_name
     cnode.type_str = base_name
-    cnode.comment = tcomm
+    cnode.comment = head_comm
+    cnode.AppendCommentText(tcomm)
 
     var bsp <- OCStrParse(body_slice)
     ParseClassBody(bsp, cnode)
@@ -402,10 +404,11 @@ func OCParser.ParseEnum(sp : OCStrParse, parent : OCodeNode, is_typedef : bool) 
     if not sp.CheckKeyword('enum'):
         return false
     endif
-    sp.SkipSpaces()
+    var head_comm : str = ''
+    sp.SkipSpacesAndComments(head_comm)
     var tag_name : str = ''
     if sp.ReadCIdent(tag_name):
-        sp.SkipSpaces()
+        sp.SkipSpacesAndComments(head_comm)
     endif
 
     if sp.readp >= sp.bufend or sp.readp^ <> '{':
@@ -438,7 +441,8 @@ func OCParser.ParseEnum(sp : OCStrParse, parent : OCodeNode, is_typedef : bool) 
 
     var enode : OCodeNode = parent.AddChild(nkEnum)
     enode.name = final_name
-    enode.comment = tcomm
+    enode.comment = head_comm
+    enode.AppendCommentText(tcomm)
 
     var bsp <- OCStrParse(body_slice)
     while bsp.readp < bsp.bufend:
@@ -516,9 +520,13 @@ func OCParser.ParseMemberOrTopDecl(sp : OCStrParse, parent : OCodeNode, in_class
     if pstop == '(':
         var param_slice : strslice
         if hsp.ReadBalanced('(', ')', param_slice):
-            hsp.SkipSpaces()
-            while hsp.CheckKeyword('const') or hsp.CheckKeyword('override') or hsp.CheckKeyword('noexcept'):
-                hsp.SkipSpaces()
+            var head_comm : str = ''
+            while true:
+                hsp.SkipSpacesAndComments(head_comm)
+                if hsp.CheckKeyword('const') or hsp.CheckKeyword('override') or hsp.CheckKeyword('noexcept'):
+                    continue
+                endif
+                break
             endwhile
 
             if hsp.readp >= hsp.bufend:
@@ -574,12 +582,13 @@ func OCParser.ParseMemberOrTopDecl(sp : OCStrParse, parent : OCodeNode, in_class
                     var fnode : OCodeNode = parent.AddChild(nkFunc)
                     fnode.name = func_name
                     fnode.type_str = ret_type
+                    fnode.comment = head_comm
                     ParseParamList(param_slice, fnode)
 
                     if stopc == ';':
                         ++sp.readp
                         fnode.is_forward = true
-                        fnode.comment = sp.ReadTrailingComment()
+                        fnode.AppendCommentText(sp.ReadTrailingComment())
                         return true
                     elif stopc == '{':
                         var body_slice : strslice
@@ -588,7 +597,7 @@ func OCParser.ParseMemberOrTopDecl(sp : OCStrParse, parent : OCodeNode, in_class
                             return false
                         endif
                         fnode.is_forward = false
-                        fnode.comment = sp.ReadTrailingComment()
+                        fnode.AppendCommentText(sp.ReadTrailingComment())
                         ParseBlock(body_slice, fnode.children)
                         return true
                     endif
@@ -1088,21 +1097,23 @@ func OCParser.ParseSwitchStmt(sp : OCStrParse, parent_list : ref [*]OCodeNode) -
     if not sp.CheckKeyword('switch'):
         return false
     endif
-    sp.SkipSpaces()
+    var scomm : str = ''
+    sp.SkipSpacesAndComments(scomm)
     var cond_slice : strslice
     if not sp.ReadBalanced('(', ')', cond_slice):
         return false
     endif
-    sp.SkipSpaces()
+    sp.SkipSpacesAndComments(scomm)
     var body_slice : strslice
     if not sp.ReadBalanced('{', '}', body_slice):
         return false
     endif
-    var scomm : str = sp.ReadTrailingComment()
+    var tcomm : str = sp.ReadTrailingComment()
 
     var snode : OCodeNode = new OCodeNode(nkSwitch)
     snode.expr_str = TranslateExpr(TrimSlice(cond_slice))
     snode.comment = scomm
+    snode.AppendCommentText(tcomm)
     parent_list.Append(snode)
 
     var bsp <- OCStrParse(body_slice)

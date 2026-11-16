@@ -56,6 +56,7 @@ public
     func AddParam(akind : NCodeNodeKind) -> OCodeNode  ..
     func AddElseChild(akind : NCodeNodeKind) -> OCodeNode ..
 
+    func AppendCommentText(new_comm : rostr) ..
     func AppendComment(rstr : ref str) ..
     func AppendRPad(rstr : ref str, text : strslice, target_len : int) ..
     func AppendExpr(rstr : ref str, text : strslice, cont_indent : str) ..
@@ -108,6 +109,16 @@ endfunc
 func OCodeNode.AddElseChild(akind : NCodeNodeKind) -> OCodeNode:
     result = new OCodeNode(akind)
     else_children.Append(result)
+endfunc
+
+func OCodeNode.AppendCommentText(new_comm : rostr):
+    if new_comm == '':
+        return
+    endif
+    if comment <> '':
+        comment += '; '
+    endif
+    comment += new_comm
 endfunc
 
 func OCodeNode.AppendComment(rstr : ref str):

@@ -24,6 +24,7 @@ public
     func SkipCLiteral() -> bool ..
     func ReadCComment(rtext : refout str, is_block : refout bool) -> bool ..
     func ReadTrailingComment() -> str ..
+    func SkipSpacesAndComments(rcomment : ref str) ..
     func ReadPreprocRaw() -> str ..
 
     func ReadBalanced(open_ch : char, close_ch : char, rslice : refout strslice) -> bool ..
@@ -205,6 +206,23 @@ func OCStrParse.ReadTrailingComment() -> str:
     endif
     SkipHSpaces()
     SkipOneLineEnd()
+endfunc
+
+func OCStrParse.SkipSpacesAndComments(rcomment : ref str):
+    while readp < bufend:
+        SkipSpaces()
+        if readp + 1 < bufend and readp^ == '/' and ((readp + 1)^ == '/' or (readp + 1)^ == '*'):
+            var c : str = ReadTrailingComment()
+            if c <> '':
+                if rcomment <> '':
+                    rcomment += '; '
+                endif
+                rcomment += c
+            endif
+        else:
+            break
+        endif
+    endwhile
 endfunc
 
 func OCStrParse.ReadPreprocRaw() -> str:
